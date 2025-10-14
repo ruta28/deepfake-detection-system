@@ -1,13 +1,15 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-from torchvision import transforms  # For data augmentation
-from torch.optim.lr_scheduler import ReduceLROnPlateau # Learning Rate Scheduler
-from torch.cuda.amp import GradScaler, autocast # Automatic Mixed Precision
-from tqdm import tqdm  # For progress bars
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from torchvision import transforms
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.cuda.amp import GradScaler, autocast
+from tqdm import tqdm
 import warnings
+from collections import Counter
 
 from src.models.cnn_lstm import CNN_LSTM
+# Make sure this import matches your dataset's filename (e.g., deepfake_dataset2)
 from src.datasets.deepfake_dataset import DeepfakeDataset
 
 warnings.filterwarnings("ignore")
@@ -84,12 +86,22 @@ if __name__ == "__main__":
         transforms.ToTensor()
     ])
 
-    # --- Datasets and Loaders ---
-    # Using the full dataset for better training
+    # --- Datasets ---
     train_set = DeepfakeDataset("data/train", transform=train_transforms)
     val_set   = DeepfakeDataset("data/val", transform=val_transforms)
 
-    train_loader = DataLoader(train_set, batch_size=CONFIG["batch_size"], shuffle=True, num_workers=CONFIG["num_workers"], pin_memory=True)
+    # --- Oversampling Logic ---
+    print("Implementing oversampling to handle data imbalance...")
+    labels = [label for _, label in train_set.samples]
+    class_counts = Counter(labels)
+    print(f"Original training set class counts: {class_counts}")
+    class_weights = {label: 1.0 / count for label, count in class_counts.items()}
+    sample_weights = [class_weights[label] for label in labels]
+    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+
+    # --- DataLoaders ---
+    # The train_loader now uses the 'sampler' and shuffle is set to False
+    train_loader = DataLoader(train_set, batch_size=CONFIG["batch_size"], sampler=sampler, num_workers=CONFIG["num_workers"], pin_memory=True)
     val_loader   = DataLoader(val_set, batch_size=CONFIG["batch_size"], shuffle=False, num_workers=CONFIG["num_workers"], pin_memory=True)
 
     # --- Model, Loss, Optimizer ---
