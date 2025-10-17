@@ -20,7 +20,7 @@ CONFIG = {
     "batch_size": 32, # Increased batch size for better GPU utilization
     "num_workers": 4,
     "learning_rate": 1e-4,
-    "epochs": 50, # Increased epochs, will be controlled by Early Stopping
+    "epochs": 10, # Increased epochs, will be controlled by Early Stopping
     "patience": 5, # For Early Stopping
 }
 
