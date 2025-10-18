@@ -1,16 +1,6 @@
 [
     {
-        "file": "data/val\\real\\033_face_366.jpg",
-        "true_label": "REAL",
-        "predicted_label": "FAKE"
-    },
-    {
-        "file": "data/val\\real\\033_face_435.jpg",
-        "true_label": "REAL",
-        "predicted_label": "FAKE"
-    },
-    {
-        "file": "data/val\\real\\033_face_450.jpg",
+        "file": "data/val\\real\\033_face_528.jpg",
         "true_label": "REAL",
         "predicted_label": "FAKE"
     },
@@ -30,12 +20,27 @@
         "predicted_label": "FAKE"
     },
     {
-        "file": "data/val\\real\\044_face_62.jpg",
+        "file": "data/val\\real\\055_face_3.jpg",
         "true_label": "REAL",
         "predicted_label": "FAKE"
     },
     {
-        "file": "data/val\\real\\055_face_3.jpg",
+        "file": "data/val\\real\\055_face_838.jpg",
+        "true_label": "REAL",
+        "predicted_label": "FAKE"
+    },
+    {
+        "file": "data/val\\real\\055_face_92.jpg",
+        "true_label": "REAL",
+        "predicted_label": "FAKE"
+    },
+    {
+        "file": "data/val\\real\\055_face_959.jpg",
+        "true_label": "REAL",
+        "predicted_label": "FAKE"
+    },
+    {
+        "file": "data/val\\real\\108_face_157.jpg",
         "true_label": "REAL",
         "predicted_label": "FAKE"
     },
@@ -45,7 +50,7 @@
         "predicted_label": "REAL"
     },
     {
-        "file": "data/val\\fake\\055_147_face_90.jpg",
+        "file": "data/val\\fake\\055_147_face_44.jpg",
         "true_label": "FAKE",
         "predicted_label": "REAL"
     }

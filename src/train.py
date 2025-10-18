@@ -8,8 +8,12 @@ from tqdm import tqdm
 import warnings
 from collections import Counter
 
-from src.models.cnn_lstm import CNN_LSTM
+# from src.models.cnn_lstm import CNN_LSTM
 # Make sure this import matches your dataset's filename
+# To this:
+from src.models.efficientnet_lstm import EfficientNet_LSTM
+# ...
+model = EfficientNet_LSTM().to(CONFIG['device'])
 from src.datasets.deepfake_dataset import DeepfakeDataset
 
 warnings.filterwarnings("ignore")

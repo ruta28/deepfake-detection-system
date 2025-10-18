@@ -6,11 +6,27 @@ from torch.utils.data import Dataset
 
 class DeepfakeDataset(Dataset):
     # 1. Add 'return_path=False' to the __init__ method
-    def __init__(self, data_dir, max_samples=None, transform=None, return_path=False):
+    # ... (imports remain the same)
+    # Add 'custom_samples=None'
+    def __init__(self, data_dir, max_samples=None, transform=None, return_path=False, custom_samples=None):
         self.data_dir = data_dir
-        self.samples = []
         self.transform = transform
-        self.return_path = return_path # 2. Store the flag
+        self.return_path = return_path
+
+        # NEW: If a custom list is provided, use it. Otherwise, build it from the directory.
+        if custom_samples:
+            self.samples = custom_samples
+        else:
+            self.samples = []
+            for label, sub_dir in enumerate(['real', 'fake']):
+                class_path = os.path.join(data_dir, sub_dir)
+                if os.path.isdir(class_path):
+                    for file_name in os.listdir(class_path):
+                        self.samples.append((os.path.join(class_path, file_name), label))
+
+        if max_samples and not custom_samples:
+            self.samples = self.samples[:max_samples]
+    # ... (__len__ and __getitem__ remain the same) # 2. Store the flag
 
         for label, sub_dir in enumerate(['real', 'fake']):
             class_path = os.path.join(data_dir, sub_dir)
