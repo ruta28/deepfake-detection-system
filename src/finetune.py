@@ -5,11 +5,11 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
 
-# Import your new, powerful model and the dataset class
+# Import your new, powerful model and the correct dataset file
 from src.models.efficientnet_lstm import EfficientNet_LSTM
 from src.datasets.deepfake_dataset2 import DeepfakeDataset
 
-# --- Configuration ---
+# --- Configuration (MOVED TO TOP) ---
 CONFIG = {
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     "base_model_path": "best_model.pth", # The expert model we are starting with
@@ -31,7 +31,8 @@ def create_finetune_dataset(json_path, transform):
         label = 1 if item['true_label'] == 'FAKE' else 0
         samples.append((item['file'], label))
         
-    return DeepfakeDataset("data", transform=transform, custom_samples=samples)
+    # We must pass 'custom_samples' to the dataset constructor
+    return DeepfakeDataset(data_dir=None, transform=transform, custom_samples=samples)
 
 
 if __name__ == "__main__":
@@ -39,6 +40,7 @@ if __name__ == "__main__":
 
     # --- Load the Expert Model ---
     print(f"Loading base model from {CONFIG['base_model_path']}")
+    # Model is now correctly loaded inside the main block
     model = EfficientNet_LSTM().to(CONFIG['device'])
     model.load_state_dict(torch.load(CONFIG['base_model_path'], map_location=CONFIG['device']))
     model.train() # Set the model to training mode

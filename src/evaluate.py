@@ -5,11 +5,11 @@ from torchvision import transforms
 from tqdm import tqdm
 from sklearn.metrics import classification_report, confusion_matrix
 
-# Import your custom modules
-from src.models.cnn_lstm import CNN_LSTM
+# Import your NEW model and the CORRECT dataset file
+from src.models.efficientnet_lstm import EfficientNet_LSTM
 from src.datasets.deepfake_dataset2 import DeepfakeDataset
 
-# --- Configuration ---
+# --- Configuration (MOVED TO TOP) ---
 CONFIG = {
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     "weights_path": "best_model.pth",
@@ -22,9 +22,16 @@ def evaluate_model():
     """Loads a trained model and evaluates it on the validation dataset."""
     print(f"Using device: {CONFIG['device']}")
 
-    # --- Load Model ---
-    model = CNN_LSTM().to(CONFIG['device'])
-    model.load_state_dict(torch.load(CONFIG['weights_path'], map_location=CONFIG['device']))
+    # --- Load Model (Now correctly inside the function) ---
+    model = EfficientNet_LSTM().to(CONFIG['device'])
+    try:
+        model.load_state_dict(torch.load(CONFIG['weights_path'], map_location=CONFIG['device']))
+    except RuntimeError as e:
+        print("\n--- !! MODEL MISMATCH ERROR !! ---")
+        print("This error means the 'best_model.pth' file does not match the")
+        print("EfficientNet_LSTM model architecture. Did you download the new")
+        print("model from Colab after training the EfficientNet version?\n")
+        raise e
     model.eval()
 
     # --- Prepare Dataset ---
