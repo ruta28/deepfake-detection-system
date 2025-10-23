@@ -21,7 +21,7 @@ CONFIG = {
     "batch_size": 8, # Reduced batch size due to memory constraints with video frames
     "num_workers": 2,
     "learning_rate": 1e-4, # Might need adjustment for video
-    "epochs": 10,
+    "epochs": 50, # Increased from 10 back to 50
     "patience": 5,
     "num_frames": 16, # Number of frames to sample per video
     "ffpp_root_dir": "data/ffpp" # Set the correct root directory
@@ -34,25 +34,22 @@ def train_one_epoch(model, loader, optimizer, criterion, scaler):
     total_loss = 0
     loop = tqdm(loader, leave=True)
     for frame_sequences, labels in loop:
-        # frame_sequences shape: [B, T, C, H, W] where T = num_frames
         frame_sequences, labels = frame_sequences.to(CONFIG["device"]), labels.float().to(CONFIG["device"])
 
-        # Use autocast context manager for mixed precision
         with autocast(enabled=(CONFIG["device"].type == 'cuda')):
-            # Model's forward method expects [B, T, C, H, W] directly
             outputs = model(frame_sequences)
-            loss = criterion(outputs.squeeze(), labels)
+            # --- CORRECTED SQUEEZE ---
+            loss = criterion(outputs.squeeze(-1), labels) # Use squeeze(-1)
+            # --- END CORRECTION ---
 
         optimizer.zero_grad()
-        # Scale loss only if using CUDA
         if CONFIG["device"].type == 'cuda':
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-        else: # Standard backward pass on CPU
+        else:
             loss.backward()
             optimizer.step()
-
 
         total_loss += loss.item()
         loop.set_postfix(loss=loss.item())
@@ -65,14 +62,18 @@ def validate(model, loader, criterion):
     with torch.no_grad():
         for frame_sequences, labels in loader:
             frame_sequences, labels = frame_sequences.to(CONFIG["device"]), labels.float().to(CONFIG["device"])
-            # Use autocast here as well if you used it in training and are on GPU
             with autocast(enabled=(CONFIG["device"].type == 'cuda')):
                 outputs = model(frame_sequences)
-                loss = criterion(outputs.squeeze(), labels)
+                # --- CORRECTED SQUEEZE ---
+                loss = criterion(outputs.squeeze(-1), labels) # Use squeeze(-1)
+                # --- END CORRECTION ---
 
             val_loss += loss.item()
-            preds = (torch.sigmoid(outputs) > 0.5).int()
-            correct += (preds.squeeze() == labels.int()).sum().item()
+            # --- CORRECTED SQUEEZE ---
+            # Squeeze only the last dim before comparing with labels
+            preds = (torch.sigmoid(outputs) > 0.5).int().squeeze(-1) # Use squeeze(-1)
+            # --- END CORRECTION ---
+            correct += (preds == labels.int()).sum().item() # Direct comparison works
             total += labels.size(0)
 
     avg_loss = val_loss / len(loader) if len(loader) > 0 else 1
@@ -86,17 +87,13 @@ if __name__ == "__main__":
     # --- Video Frame Transformations (Resize and Normalize ENABLED) ---
     video_transforms = transforms.Compose([
         transforms.ToTensor(), # Input to this is now a NumPy array (HWC) from OpenCV
-        # EfficientNet-B0 expects 224x224 input
         transforms.Resize((224, 224), antialias=True), # Apply Resize
-        # Use standard ImageNet normalization
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), # Apply Normalize
     ])
 
     # --- Datasets (Using FFPPVideoDataset) ---
     try:
-        # Pass the correct root directory and specify 'train' split
         train_set = FFPPVideoDataset(CONFIG["ffpp_root_dir"], num_frames=CONFIG["num_frames"], transform=video_transforms, split='train')
-        # Pass the correct root directory and specify 'val' split
         val_set   = FFPPVideoDataset(CONFIG["ffpp_root_dir"], num_frames=CONFIG["num_frames"], transform=video_transforms, split='val')
     except RuntimeError as e:
         print(f"\n---!!! Dataset Loading Error !!!---")
@@ -115,7 +112,7 @@ if __name__ == "__main__":
     class_counts = Counter(train_labels)
     print(f"Training video class counts: {class_counts}")
 
-    sampler = None # Initialize sampler to None
+    sampler = None
     majority_count = max(class_counts.values()) if class_counts else 0
     minority_count = min(class_counts.values()) if class_counts else 0
     if majority_count > 0 and minority_count > 0 and minority_count < 0.8 * majority_count:
@@ -135,7 +132,6 @@ if __name__ == "__main__":
         shuffle=(sampler is None),
         num_workers=CONFIG["num_workers"],
         pin_memory=True,
-        # persistent_workers=True if CONFIG["num_workers"] > 0 else False
     )
     val_loader   = DataLoader(
         val_set,
@@ -143,7 +139,6 @@ if __name__ == "__main__":
         shuffle=False,
         num_workers=CONFIG["num_workers"],
         pin_memory=True,
-        # persistent_workers=True if CONFIG["num_workers"] > 0 else False
     )
 
     # --- Model, Loss, Optimizer ---
@@ -153,7 +148,7 @@ if __name__ == "__main__":
 
     # --- Performance Boosters ---
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3)
-    scaler = GradScaler(enabled=(CONFIG["device"].type == 'cuda')) # Correctly enable scaler only for CUDA
+    scaler = GradScaler(enabled=(CONFIG["device"].type == 'cuda'))
 
     # --- Training Loop with Early Stopping ---
     best_val_loss = float('inf')
@@ -161,9 +156,7 @@ if __name__ == "__main__":
     
     print(f"\nStarting FFPP video training for {CONFIG['epochs']} epochs...")
     for epoch in range(CONFIG["epochs"]):
-        # Pass scaler correctly
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler)
-        # Assuming validate doesn't modify gradients, no scaler needed unless using autocast
         val_loss, val_acc = validate(model, val_loader, criterion)
         print(f"Epoch {epoch+1}/{CONFIG['epochs']} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%")
         scheduler.step(val_loss)
@@ -181,4 +174,3 @@ if __name__ == "__main__":
             break
 
     print(f"Video training complete. Best model saved to best_video_model.pth")
-
