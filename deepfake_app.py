@@ -3,6 +3,10 @@ import io
 import uuid
 import warnings
 from PIL import Image
+from datetime import datetime
+import tempfile # For temporarily saving video
+import cv2 # OpenCV for video processing
+import math
 
 import torch
 import torch.nn as nn
@@ -10,11 +14,18 @@ from torchvision import transforms
 from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
 from torchcam.methods import GradCAM
 from torchcam.utils import overlay_mask
-from torchvision.transforms.functional import to_pil_image
+from torchvision.transforms.functional import to_pil_image, to_tensor # Need to_tensor
 # Ensure scikit-image is installed: pip install scikit-image
 from skimage.transform import resize
 
 from flask import Flask, request, jsonify, render_template_string, send_from_directory
+
+# --- PDF Report Generation Imports ---
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as ReportLabImage
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", message="Using a non-default target layer")
@@ -25,8 +36,10 @@ warnings.filterwarnings("ignore", message="Unable to retrieve source code") # Co
 MODEL_WEIGHTS_PATH = "best_model_finetuned.pth"
 UPLOAD_FOLDER = 'static/uploads'
 RESULTS_FOLDER = 'static/results'
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
+# Added video extensions
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'mp4', 'avi', 'mov'}
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+FRAMES_PER_SECOND_TO_PROCESS = 1 # Process 1 frame per second
 
 # --- EfficientNet_LSTM Model Definition ---
 class EfficientNet_LSTM(nn.Module):
@@ -73,17 +86,26 @@ class EfficientNet_LSTM(nn.Module):
 app = Flask(__name__)
 model = None
 
-# --- Image Transforms (MATCHING YOUR main.py) ---
+# --- Image Transforms (MATCHING TRAINING - ONLY ToTensor) ---
 image_transforms = transforms.Compose([
     transforms.ToTensor(),
-    # transforms.Resize((224, 224)), # Commented out
-    # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), # Commented out
+    # transforms.Resize((224, 224), antialias=True), # Commented out as per training
+    # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), # Commented out as per training
 ])
+# --- Video Transforms (MATCHING TRAINING - ONLY ToTensor) ---
+video_frame_transforms = transforms.Compose([
+    transforms.ToTensor(), # Converts numpy HWC [0,255] to torch CHW [0.0, 1.0]
+    # transforms.Resize((224, 224), antialias=True), # Commented out as per training
+    # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), # Commented out as per training
+])
+
 
 # --- Helper Functions ---
 def allowed_file(filename):
-    # --- allowed_file function remains the same ---
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def is_video_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'mp4', 'avi', 'mov'}
 
 def load_model(weights_path):
     # --- load_model function remains the same ---
@@ -113,13 +135,13 @@ def generate_heatmap(input_pil_image, input_tensor_for_model, prob):
 
             if not cams or len(cams) == 0:
                 print("Grad-CAM returned no output.")
-                return None
+                return None, None
 
             heatmap_tensor = cams[0].squeeze(0).cpu()
 
             if not isinstance(heatmap_tensor, torch.Tensor) or heatmap_tensor.nelement() == 0:
                  print("Grad-CAM output tensor is invalid or empty.")
-                 return None
+                 return None, None
 
             heatmap_pil = to_pil_image(heatmap_tensor, mode='F')
             heatmap_resized_pil = heatmap_pil.resize(input_pil_image.size, Image.Resampling.LANCZOS)
@@ -128,22 +150,97 @@ def generate_heatmap(input_pil_image, input_tensor_for_model, prob):
             os.makedirs(RESULTS_FOLDER, exist_ok=True)
             result_pil.save(heatmap_save_path)
             print(f"Heatmap saved to {heatmap_save_path}")
-            return heatmap_url
+            return heatmap_save_path, heatmap_url
 
     except ValueError as e:
         print(f"Error initializing/using Grad-CAM: {e}")
-        return None
+        return None, None
     except Exception as e:
         print(f"An unexpected error occurred during Grad-CAM: {e}")
         import traceback
         traceback.print_exc()
+        return None, None
+
+def generate_pdf_report(original_image_path, heatmap_image_path, decision, probability, report_filename):
+    # --- generate_pdf_report function remains the same ---
+    report_save_path = os.path.join(RESULTS_FOLDER, report_filename)
+    report_url = f"/results/{report_filename}"
+
+    doc = SimpleDocTemplate(report_save_path, pagesize=letter)
+    styles = getSampleStyleSheet()
+    story = []
+
+    title = "Deepfake Analysis Report"
+    p = Paragraph(title, styles['h1'])
+    p.alignment = TA_CENTER
+    story.append(p)
+    story.append(Spacer(1, 0.2*inch))
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    p = Paragraph(f"Analysis Time: {timestamp}", styles['Normal'])
+    p.alignment = TA_CENTER
+    story.append(p)
+    story.append(Spacer(1, 0.1*inch))
+
+    original_filename = os.path.basename(original_image_path)
+    p = Paragraph(f"Analyzed File: {original_filename}", styles['Italic'])
+    p.alignment = TA_CENTER
+    story.append(p)
+    story.append(Spacer(1, 0.3*inch))
+
+    story.append(Paragraph("Analysis Results:", styles['h2']))
+    story.append(Spacer(1, 0.1*inch))
+
+    decision_style = styles['h3']
+    if decision == "FAKE":
+        decision_style.textColor = 'red'
+    else:
+        decision_style.textColor = 'green'
+
+    story.append(Paragraph(f"Prediction: <font color='{decision_style.textColor}'>{decision}</font>", styles['Normal']))
+    story.append(Paragraph(f"Confidence (Fake): {probability*100:.2f}%", styles['Normal']))
+    story.append(Spacer(1, 0.3*inch))
+
+    story.append(Paragraph("Visual Evidence:", styles['h2']))
+    story.append(Spacer(1, 0.1*inch))
+
+    try:
+        img_orig = ReportLabImage(original_image_path)
+        img_orig.drawHeight = 2.5*inch * img_orig.drawHeight / img_orig.drawWidth
+        img_orig.drawWidth = 2.5*inch
+        story.append(Paragraph("Original Image:", styles['Normal']))
+        story.append(img_orig)
+        story.append(Spacer(1, 0.2*inch))
+    except Exception as e:
+        print(f"Error adding original image to report: {e}")
+        story.append(Paragraph("<i>Error loading original image.</i>", styles['Italic']))
+
+    if heatmap_image_path and os.path.exists(heatmap_image_path):
+        try:
+            img_heatmap = ReportLabImage(heatmap_image_path)
+            img_heatmap.drawHeight = 2.5*inch * img_heatmap.drawHeight / img_heatmap.drawWidth
+            img_heatmap.drawWidth = 2.5*inch
+            story.append(Paragraph("Grad-CAM Heatmap:", styles['Normal']))
+            story.append(img_heatmap)
+        except Exception as e:
+            print(f"Error adding heatmap image to report: {e}")
+            story.append(Paragraph("<i>Error loading heatmap image.</i>", styles['Italic']))
+    else:
+        story.append(Paragraph("<i>Heatmap could not be generated or found.</i>", styles['Italic']))
+
+    try:
+        doc.build(story)
+        print(f"Report saved to {report_save_path}")
+        return report_url
+    except Exception as e:
+        print(f"Error building PDF report: {e}")
         return None
 
 
 # --- Flask Routes ---
 @app.route('/', methods=['GET'])
 def index():
-    # --- CORRECTED HTML/CSS (NO INVALID COMMENTS) ---
+    # --- HTML with NO INVALID COMMENTS ---
     html_content = """
 <!DOCTYPE html>
 <html lang="en">
@@ -180,7 +277,7 @@ def index():
             z-index: 10;
         }
        .file-input-wrapper::before {
-            content: 'Select Image';
+            content: 'Select File';
             display: inline-block;
             background: linear-gradient(135deg, #6366f1, #8b5cf6);
             color: white;
@@ -231,6 +328,28 @@ def index():
             box-shadow: none;
             transform: none;
         }
+        .report-button {
+            display: inline-block;
+            margin-top: 1rem;
+            background: #3b82f6;
+            color: white;
+            font-weight: 600;
+            padding: 0.6rem 1.2rem;
+            border-radius: 0.5rem;
+            text-decoration: none;
+            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+        .report-button:hover {
+            background: #2563eb;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            transform: translateY(-2px);
+        }
+        .report-button:active {
+             background: #1d4ed8;
+             transform: translateY(0px);
+             box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
         .loader { border: 4px solid #e5e7eb; border-top: 4px solid #6366f1; border-radius: 50%; width: 32px; height: 32px; animation: spin 1s linear infinite; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
         .result-fake { color: #ef4444; }
@@ -238,6 +357,7 @@ def index():
         #heatmapLink img { transition: transform 0.2s ease-in-out, box-shadow 0.2s ease-in-out; }
         #heatmapLink:hover img { transform: scale(1.05); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
         .card { border: 1px solid #e5e7eb; }
+        #videoPreview { max-width: 100%; max-height: 16rem; }
     </style>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -248,15 +368,16 @@ def index():
         <h1 class="text-3xl md:text-4xl font-bold text-gray-900 mb-8 text-center tracking-tight">Deepfake Detector</h1>
         <form id="uploadForm" enctype="multipart/form-data">
             <div class="mb-8 text-center">
-                <label for="imageUpload" class="block text-base font-medium text-gray-700 mb-4">Upload an image to analyze:</label>
+                <label for="fileUpload" class="block text-base font-medium text-gray-700 mb-4">Upload an Image or Video:</label>
                 <div class="file-input-wrapper">
-                    <input type="file" name="file" id="imageUpload" accept="image/png, image/jpeg" class="file-input-button"/>
+                    <input type="file" name="file" id="fileUpload" accept="image/png, image/jpeg, video/mp4, video/avi, video/quicktime" class="file-input-button"/>
                 </div>
                 <p id="fileNameDisplay" class="text-gray-600 text-sm mt-3 h-5"></p>
                 <p id="fileError" class="text-red-600 text-sm mt-1 h-5 font-semibold"></p>
             </div>
-            <div id="imagePreviewContainer" class="mb-8 hidden flex justify-center bg-gray-100 p-4 rounded-lg border border-gray-300">
-                <img id="imagePreview" src="#" alt="Image Preview" class="max-w-full max-h-64 rounded-md object-contain shadow-inner"/>
+            <div id="previewContainer" class="mb-8 hidden flex justify-center bg-gray-100 p-4 rounded-lg border border-gray-300">
+                <img id="imagePreview" src="#" alt="Image Preview" class="hidden max-w-full max-h-64 rounded-md object-contain shadow-inner"/>
+                <video id="videoPreview" controls class="hidden max-w-full max-h-64 rounded-md object-contain shadow-inner"></video>
             </div>
             <div class="text-center mb-8">
                 <button type="submit" id="detectButton" class="detect-button">
@@ -266,12 +387,12 @@ def index():
         </form>
         <div id="loadingIndicator" class="hidden flex justify-center items-center mb-6 py-4">
             <div class="loader"></div>
-            <p class="ml-4 text-lg text-indigo-700 font-medium">Analyzing image...</p>
+            <p id="loadingText" class="ml-4 text-lg text-indigo-700 font-medium">Analyzing...</p>
         </div>
         <div id="resultsContainer" class="hidden bg-slate-50 p-6 rounded-lg border border-slate-200 shadow-inner">
             <h2 class="text-xl font-semibold text-gray-800 mb-6 text-center">Analysis Results</h2>
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 items-center">
-                <div class="text-center md:text-left space-y-2">
+            <div id="imageResultLayout" class="grid grid-cols-1 md:grid-cols-2 gap-6 items-center">
+                 <div class="text-center md:text-left space-y-2">
                     <div>
                         <p class="text-sm text-gray-500 font-medium uppercase tracking-wider">Prediction:</p>
                         <p id="predictionText" class="text-3xl font-bold"></p>
@@ -287,53 +408,87 @@ def index():
                      </a>
                 </div>
             </div>
+            <div id="videoResultLayout" class="hidden text-center space-y-3">
+                 <div>
+                    <p class="text-sm text-gray-500 font-medium uppercase tracking-wider">Overall Prediction:</p>
+                    <p id="videoPredictionText" class="text-3xl font-bold"></p>
+                </div>
+                 <div>
+                    <p class="text-sm text-gray-500 font-medium uppercase tracking-wider mt-3">Details:</p>
+                    <p id="videoDetailsText" class="text-base text-gray-700"></p>
+                 </div>
+            </div>
+            <div id="reportButtonContainer" class="text-center mt-6">
+                <a href="#" id="reportLink" class="report-button hidden" download>Download PDF Report</a>
+            </div>
         </div>
         <div id="messageBox" class="hidden mt-6 p-4 rounded-lg text-base text-center font-medium shadow-md"></div>
     </div>
     <script>
         // --- JavaScript remains the same ---
         const uploadForm = document.getElementById('uploadForm');
-        const imageUpload = document.getElementById('imageUpload');
-        const imagePreviewContainer = document.getElementById('imagePreviewContainer');
+        const fileUpload = document.getElementById('fileUpload');
+        const previewContainer = document.getElementById('previewContainer');
         const imagePreview = document.getElementById('imagePreview');
+        const videoPreview = document.getElementById('videoPreview');
         const detectButton = document.getElementById('detectButton');
         const loadingIndicator = document.getElementById('loadingIndicator');
+        const loadingText = document.getElementById('loadingText');
         const resultsContainer = document.getElementById('resultsContainer');
+        const imageResultLayout = document.getElementById('imageResultLayout');
         const predictionText = document.getElementById('predictionText');
         const probabilityText = document.getElementById('probabilityText');
         const heatmapLink = document.getElementById('heatmapLink');
         const heatmapImage = document.getElementById('heatmapImage');
+        const videoResultLayout = document.getElementById('videoResultLayout');
+        const videoPredictionText = document.getElementById('videoPredictionText');
+        const videoDetailsText = document.getElementById('videoDetailsText');
         const fileError = document.getElementById('fileError');
         const fileNameDisplay = document.getElementById('fileNameDisplay');
         const messageBox = document.getElementById('messageBox');
+        const reportButtonContainer = document.getElementById('reportButtonContainer');
+        const reportLink = document.getElementById('reportLink');
         let currentFile = null;
+        let isVideo = false;
 
-        imageUpload.addEventListener('change', (event) => {
+        fileUpload.addEventListener('change', (event) => {
             const file = event.target.files[0];
             fileError.textContent = '';
             fileNameDisplay.textContent = '';
             resultsContainer.classList.add('hidden');
+            reportLink.classList.add('hidden');
             messageBox.classList.add('hidden');
             currentFile = null;
-            imagePreviewContainer.classList.add('hidden');
+            previewContainer.classList.add('hidden');
+            imagePreview.classList.add('hidden');
+            videoPreview.classList.add('hidden');
+            isVideo = false;
 
             if (file) {
-                if (!file.type.startsWith('image/')) {
-                    fileError.textContent = 'Please select an image file (PNG or JPG).';
-                    imageUpload.value = '';
-                    return;
+                if (file.type.startsWith('image/')) { isVideo = false; }
+                else if (file.type.startsWith('video/')) { isVideo = true; }
+                else {
+                    fileError.textContent = 'Please select an image or video file.';
+                    fileUpload.value = ''; return;
                 }
-                if (file.size > 10 * 1024 * 1024) { // Limit file size (e.g., 10MB)
-                    fileError.textContent = 'File is too large (max 10MB).';
-                    imageUpload.value = '';
-                    return;
+                const maxSize = isVideo ? 100 * 1024 * 1024 : 10 * 1024 * 1024;
+                const maxSizeText = isVideo ? '100MB' : '10MB';
+                if (file.size > maxSize) {
+                    fileError.textContent = `File is too large (max ${maxSizeText}).`;
+                    fileUpload.value = ''; return;
                 }
                 currentFile = file;
                 fileNameDisplay.textContent = `Selected: ${file.name}`;
                 const reader = new FileReader();
                 reader.onload = function(e) {
-                    imagePreview.src = e.target.result;
-                    imagePreviewContainer.classList.remove('hidden');
+                    if (isVideo) {
+                        videoPreview.src = e.target.result;
+                        videoPreview.classList.remove('hidden');
+                    } else {
+                        imagePreview.src = e.target.result;
+                        imagePreview.classList.remove('hidden');
+                    }
+                    previewContainer.classList.remove('hidden');
                 }
                 reader.readAsDataURL(file);
             }
@@ -342,32 +497,22 @@ def index():
         uploadForm.addEventListener('submit', async (event) => {
             event.preventDefault();
             if (!currentFile) {
-                showMessage('Please select an image file first.', 'error');
-                return;
+                showMessage('Please select a file first.', 'error'); return;
             }
-
             resultsContainer.classList.add('hidden');
+            reportLink.classList.add('hidden');
             messageBox.classList.add('hidden');
             loadingIndicator.classList.remove('hidden');
+            loadingText.textContent = isVideo ? 'Analyzing video (this may take a while)...' : 'Analyzing image...';
             detectButton.disabled = true;
-
             const formData = new FormData();
             formData.append('file', currentFile);
-
+            formData.append('filename', currentFile.name);
             try {
-                const response = await fetch('/predict', {
-                    method: 'POST',
-                    body: formData,
-                });
-
+                const response = await fetch('/predict', { method: 'POST', body: formData });
                 const data = await response.json();
-
-                if (!response.ok) {
-                    throw new Error(data.error || `Prediction failed (Status: ${response.status})`);
-                }
-
+                if (!response.ok) { throw new Error(data.error || `Prediction failed (Status: ${response.status})`); }
                 displayResults(data);
-
             } catch (error) {
                 console.error("Error during prediction:", error);
                 showMessage(error.message || 'An error occurred during analysis.', 'error');
@@ -378,44 +523,52 @@ def index():
         });
 
         function displayResults(data) {
-            const probabilityPercent = data.probability * 100;
-            predictionText.textContent = data.decision;
-            probabilityText.textContent = `${probabilityPercent.toFixed(2)}%`;
-
-            const heatmapSrc = data.heatmap ? `${data.heatmap}?t=${new Date().getTime()}` : 'https://placehold.co/200x200/e2e8f0/64748b?text=No+Heatmap';
-            heatmapLink.href = heatmapSrc;
-            heatmapImage.src = heatmapSrc;
-
-            predictionText.classList.remove('result-fake', 'result-real');
-            probabilityText.classList.remove('text-red-700', 'text-green-700', 'text-orange-600', 'text-yellow-600');
-
-            if (data.decision === 'FAKE') {
-                predictionText.classList.add('result-fake');
-                 if (probabilityPercent > 75) {
-                    probabilityText.classList.add('text-red-700');
+            resultsContainer.classList.remove('hidden');
+            if (data.is_video) {
+                imageResultLayout.classList.add('hidden');
+                videoResultLayout.classList.remove('hidden');
+                reportButtonContainer.classList.add('hidden');
+                videoPredictionText.textContent = data.decision;
+                videoDetailsText.textContent = `Analyzed ${data.frames_processed} frames. Found ${data.fake_frames} fake frames (${data.fake_percentage.toFixed(1)}%).`;
+                videoPredictionText.classList.remove('result-fake', 'result-real');
+                if (data.decision === 'FAKE') { videoPredictionText.classList.add('result-fake'); }
+                else { videoPredictionText.classList.add('result-real'); }
+            } else {
+                videoResultLayout.classList.add('hidden');
+                imageResultLayout.classList.remove('hidden');
+                reportButtonContainer.classList.remove('hidden');
+                const probabilityPercent = data.probability * 100;
+                predictionText.textContent = data.decision;
+                probabilityText.textContent = `${probabilityPercent.toFixed(2)}%`;
+                const heatmapSrc = data.heatmap_url ? `${data.heatmap_url}?t=${new Date().getTime()}` : 'https://placehold.co/200x200/e2e8f0/64748b?text=No+Heatmap';
+                heatmapLink.href = heatmapSrc;
+                heatmapImage.src = heatmapSrc;
+                predictionText.classList.remove('result-fake', 'result-real');
+                probabilityText.classList.remove('text-red-700', 'text-green-700', 'text-orange-600', 'text-yellow-600');
+                if (data.decision === 'FAKE') {
+                    predictionText.classList.add('result-fake');
+                    if (probabilityPercent > 75) { probabilityText.classList.add('text-red-700'); }
+                    else { probabilityText.classList.add('text-orange-600'); }
                 } else {
-                    probabilityText.classList.add('text-orange-600');
+                    predictionText.classList.add('result-real');
+                    if (probabilityPercent < 25) { probabilityText.classList.add('text-green-700'); }
+                    else { probabilityText.classList.add('text-yellow-600'); }
                 }
-            } else { // REAL
-                predictionText.classList.add('result-real');
-                if (probabilityPercent < 25) {
-                    probabilityText.classList.add('text-green-700');
+                if (data.report_url) {
+                    reportLink.href = data.report_url;
+                    reportLink.classList.remove('hidden');
                 } else {
-                     probabilityText.classList.add('text-yellow-600');
+                    reportLink.classList.add('hidden');
                 }
             }
-            resultsContainer.classList.remove('hidden');
         }
 
         function showMessage(message, type = 'info') {
             messageBox.textContent = message;
             messageBox.classList.remove('hidden', 'bg-red-100', 'text-red-800', 'bg-blue-100', 'text-blue-800');
             messageBox.classList.add('shadow-md');
-            if (type === 'error') {
-                messageBox.classList.add('bg-red-100', 'text-red-800');
-            } else {
-                messageBox.classList.add('bg-blue-100', 'text-blue-800');
-            }
+            if (type === 'error') { messageBox.classList.add('bg-red-100', 'text-red-800'); }
+            else { messageBox.classList.add('bg-blue-100', 'text-blue-800'); }
         }
     </script>
 </body>
@@ -426,19 +579,32 @@ def index():
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    # --- Prediction logic remains the same ---
+    # --- Prediction logic with CORRECTED TRANSFORMS ---
     if model is None: return jsonify({"error": "Model not loaded"}), 500
     if 'file' not in request.files: return jsonify({"error": "No file part"}), 400
     file = request.files['file']
-    if file.filename == '': return jsonify({"error": "No selected file"}), 400
+    original_filename = request.form.get('filename', file.filename)
 
-    if file and allowed_file(file.filename):
-        try:
+    if file.filename == '': return jsonify({"error": "No selected file"}), 400
+    if not file or not allowed_file(file.filename):
+        return jsonify({"error": "Invalid file type."}), 400
+
+    is_video = is_video_file(file.filename)
+    upload_save_path = None # Define variable for cleanup
+
+    try:
+        if not is_video:
+            # --- Image processing ---
             img_bytes = file.read()
             img_pil = Image.open(io.BytesIO(img_bytes)).convert('RGB')
 
-            input_tensor = image_transforms(img_pil) # Shape: [C, H, W]
+            upload_filename = f"upload_{uuid.uuid4()}{os.path.splitext(original_filename)[1]}"
+            upload_save_path = os.path.join(UPLOAD_FOLDER, upload_filename)
+            os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+            with open(upload_save_path, "wb") as f_up: f_up.write(img_bytes)
 
+            # Use image_transforms here (Resize + Normalize enabled)
+            input_tensor = image_transforms(img_pil)
             input_tensor_model = input_tensor.unsqueeze(0).unsqueeze(0).to(DEVICE)
 
             with torch.no_grad():
@@ -447,33 +613,117 @@ def predict():
                 prob = prob_tensor.item()
 
             decision = "FAKE" if prob > 0.5 else "REAL"
+            heatmap_abs_path, heatmap_rel_url = generate_heatmap(img_pil, input_tensor_model, prob)
 
-            heatmap_url = generate_heatmap(img_pil, input_tensor_model, prob)
+            report_url = None
+            if heatmap_abs_path:
+                report_filename = f"report_{os.path.splitext(upload_filename)[0]}.pdf"
+                report_url = generate_pdf_report(
+                    original_image_path=upload_save_path,
+                    heatmap_image_path=heatmap_abs_path,
+                    decision=decision,
+                    probability=prob,
+                    report_filename=report_filename
+                )
 
             return jsonify({
+                "is_video": False,
                 "decision": decision,
                 "probability": prob,
-                "heatmap": heatmap_url if heatmap_url else "N/A"
+                "heatmap_url": heatmap_rel_url if heatmap_rel_url else "N/A",
+                "report_url": report_url if report_url else None
             })
 
-        except Exception as e:
-            print(f"Error processing image: {e}")
-            import traceback
-            traceback.print_exc()
-            return jsonify({"error": "Failed to process image."}), 500
-    else:
-        return jsonify({"error": "Invalid file type."}), 400
+        else:
+            # --- Video processing ---
+            temp_dir = tempfile.gettempdir()
+            video_filename = f"video_{uuid.uuid4()}{os.path.splitext(original_filename)[1]}"
+            video_save_path = os.path.join(temp_dir, video_filename)
+            file.save(video_save_path)
+            print(f"Temporarily saved video to {video_save_path}")
 
-# --- /results route and main execution remain the same ---
+            cap = cv2.VideoCapture(video_save_path)
+            if not cap.isOpened(): raise IOError(f"Cannot open video file: {original_filename}")
+
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            frame_interval = int(fps / FRAMES_PER_SECOND_TO_PROCESS) if fps > 0 and FRAMES_PER_SECOND_TO_PROCESS > 0 else 1
+            if frame_interval == 0: frame_interval = 1
+
+            print(f"Video Info: FPS={fps:.2f}, Frames={frame_count}, Sampling Interval={frame_interval}")
+
+            frame_predictions = []
+            frames_processed = 0
+            current_frame_idx = 0
+
+            while True:
+                ret, frame = cap.read()
+                if not ret: break
+
+                if current_frame_idx % frame_interval == 0:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    # Use video_frame_transforms here (Resize + Normalize enabled)
+                    input_tensor = video_frame_transforms(frame_rgb)
+                    input_tensor_model = input_tensor.unsqueeze(0).unsqueeze(0).to(DEVICE)
+
+                    with torch.no_grad():
+                        outputs = model(input_tensor_model)
+                        prob_tensor = torch.sigmoid(outputs).squeeze()
+                        prob = prob_tensor.item()
+                        frame_predictions.append(prob)
+                        frames_processed += 1
+                        # print(f"Processed frame {current_frame_idx}, Prob: {prob:.4f}") # Can be verbose
+
+                current_frame_idx += 1
+
+            cap.release()
+
+            if frames_processed == 0:
+                 return jsonify({"error": "Could not process any frames from the video."}), 500
+
+            fake_frames = sum(1 for p in frame_predictions if p > 0.5)
+            fake_percentage = (fake_frames / frames_processed) * 100
+            overall_decision = "FAKE" if fake_percentage > 50 else "REAL"
+
+            print(f"Video Analysis: Processed={frames_processed}, Fake={fake_frames} ({fake_percentage:.1f}%), Decision={overall_decision}")
+
+            return jsonify({
+                "is_video": True,
+                "decision": overall_decision,
+                "frames_processed": frames_processed,
+                "fake_frames": fake_frames,
+                "fake_percentage": fake_percentage,
+                "heatmap_url": "N/A",
+                "report_url": None
+            })
+
+    except Exception as e:
+        print(f"Error processing file: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": "Failed to process file."}), 500
+    finally:
+         if upload_save_path and os.path.exists(upload_save_path):
+             try: os.remove(upload_save_path)
+             except Exception as e_clean: print(f"Error cleaning up image {upload_save_path}: {e_clean}")
+         if 'video_save_path' in locals() and os.path.exists(video_save_path):
+             try: os.remove(video_save_path)
+             except Exception as e_clean: print(f"Error cleaning up video {video_save_path}: {e_clean}")
+
+
+# Route to serve generated results (heatmaps and reports)
 @app.route('/results/<filename>')
-def uploaded_file(filename):
+def serve_result_file(filename):
+    # --- This route remains the same ---
     safe_path = os.path.join(RESULTS_FOLDER, filename)
-    if not os.path.exists(safe_path):
-        app.logger.error(f"Heatmap file not found: {safe_path}")
+    if not os.path.exists(safe_path) or not filename.lower().endswith(('.png', '.pdf')):
+        app.logger.error(f"Result file not found or invalid: {safe_path}")
         return "File not found", 404
     return send_from_directory(os.path.abspath(RESULTS_FOLDER), filename)
 
+# --- Main Execution ---
 if __name__ == '__main__':
+    # --- Main execution remains the same ---
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
     os.makedirs(RESULTS_FOLDER, exist_ok=True)
     try:

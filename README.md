@@ -204,7 +204,6 @@ The heatmap is automatically saved as:
 
 * Integrate **video processing** for frame-by-frame detection
 * Experiment with **Vision Transformers (ViT)** or other backbones
-* Build a **web API** (Flask/FastAPI) + **React frontend**
 * Explore **GAN fingerprinting** and **frequency-based features**
 
 ---
