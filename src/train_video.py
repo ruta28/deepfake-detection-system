@@ -21,7 +21,7 @@ CONFIG = {
     "batch_size": 8, # Reduced batch size due to memory constraints with video frames
     "num_workers": 2,
     "learning_rate": 1e-4, # Might need adjustment for video
-    "epochs": 50,
+    "epochs": 10,
     "patience": 5,
     "num_frames": 16, # Number of frames to sample per video
     "ffpp_root_dir": "data/ffpp" # Set the correct root directory
