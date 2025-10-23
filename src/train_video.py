@@ -37,17 +37,22 @@ def train_one_epoch(model, loader, optimizer, criterion, scaler):
         # frame_sequences shape: [B, T, C, H, W] where T = num_frames
         frame_sequences, labels = frame_sequences.to(CONFIG["device"]), labels.float().to(CONFIG["device"])
 
-        with autocast():
+        # Use autocast context manager for mixed precision
+        with autocast(enabled=(CONFIG["device"].type == 'cuda')):
             # Model's forward method expects [B, T, C, H, W] directly
             outputs = model(frame_sequences)
             loss = criterion(outputs.squeeze(), labels)
 
         optimizer.zero_grad()
-        scaler.scale(loss).backward()
-        # Optional: Gradient Clipping can help stabilize training with LSTMs
-        # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
+        # Scale loss only if using CUDA
+        if CONFIG["device"].type == 'cuda':
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else: # Standard backward pass on CPU
+            loss.backward()
+            optimizer.step()
+
 
         total_loss += loss.item()
         loop.set_postfix(loss=loss.item())
@@ -60,7 +65,8 @@ def validate(model, loader, criterion):
     with torch.no_grad():
         for frame_sequences, labels in loader:
             frame_sequences, labels = frame_sequences.to(CONFIG["device"]), labels.float().to(CONFIG["device"])
-            with autocast():
+            # Use autocast here as well if you used it in training and are on GPU
+            with autocast(enabled=(CONFIG["device"].type == 'cuda')):
                 outputs = model(frame_sequences)
                 loss = criterion(outputs.squeeze(), labels)
 
@@ -77,11 +83,13 @@ def validate(model, loader, criterion):
 if __name__ == "__main__":
     print(f"Using device: {CONFIG['device']}")
 
-    # --- Video Frame Transformations (Matching Previous Successful Image Training - ONLY ToTensor) ---
+    # --- Video Frame Transformations (Resize and Normalize ENABLED) ---
     video_transforms = transforms.Compose([
         transforms.ToTensor(), # Input to this is now a NumPy array (HWC) from OpenCV
-        # transforms.Resize((224, 224), antialias=True), # Commented out
-        # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), # Commented out
+        # EfficientNet-B0 expects 224x224 input
+        transforms.Resize((224, 224), antialias=True), # Apply Resize
+        # Use standard ImageNet normalization
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), # Apply Normalize
     ])
 
     # --- Datasets (Using FFPPVideoDataset) ---
@@ -108,7 +116,6 @@ if __name__ == "__main__":
     print(f"Training video class counts: {class_counts}")
 
     sampler = None # Initialize sampler to None
-    # Example: Apply oversampling if one class is less than 80% the size of the other
     majority_count = max(class_counts.values()) if class_counts else 0
     minority_count = min(class_counts.values()) if class_counts else 0
     if majority_count > 0 and minority_count > 0 and minority_count < 0.8 * majority_count:
@@ -121,15 +128,14 @@ if __name__ == "__main__":
 
 
     # --- DataLoaders ---
-    # Use sampler if defined, otherwise shuffle=True
     train_loader = DataLoader(
         train_set,
         batch_size=CONFIG["batch_size"],
-        sampler=sampler, # Pass sampler here
-        shuffle=(sampler is None), # Only shuffle if sampler is not used
+        sampler=sampler,
+        shuffle=(sampler is None),
         num_workers=CONFIG["num_workers"],
         pin_memory=True,
-        # persistent_workers=True if CONFIG["num_workers"] > 0 else False # Can speed up loading
+        # persistent_workers=True if CONFIG["num_workers"] > 0 else False
     )
     val_loader   = DataLoader(
         val_set,
@@ -147,8 +153,7 @@ if __name__ == "__main__":
 
     # --- Performance Boosters ---
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3)
-    # Ensure scaler is only enabled when using CUDA
-    scaler = GradScaler(enabled=(CONFIG["device"].type == 'cuda'))
+    scaler = GradScaler(enabled=(CONFIG["device"].type == 'cuda')) # Correctly enable scaler only for CUDA
 
     # --- Training Loop with Early Stopping ---
     best_val_loss = float('inf')
@@ -156,10 +161,10 @@ if __name__ == "__main__":
     
     print(f"\nStarting FFPP video training for {CONFIG['epochs']} epochs...")
     for epoch in range(CONFIG["epochs"]):
-        # Pass scaler correctly, even if on CPU (it will be disabled)
+        # Pass scaler correctly
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler)
-        # Pass scaler to validate function if autocast is used there too
-        val_loss, val_acc = validate(model, val_loader, criterion) # Assuming validate doesn't use scaler
+        # Assuming validate doesn't modify gradients, no scaler needed unless using autocast
+        val_loss, val_acc = validate(model, val_loader, criterion)
         print(f"Epoch {epoch+1}/{CONFIG['epochs']} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%")
         scheduler.step(val_loss)
 
