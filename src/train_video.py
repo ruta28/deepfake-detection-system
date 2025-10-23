@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader # Removed WeightedRandomSampler for now
+from torch.utils.data import DataLoader, WeightedRandomSampler # Added Sampler back
 from torchvision import transforms
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.cuda.amp import GradScaler, autocast
@@ -8,8 +8,8 @@ from tqdm import tqdm
 import warnings
 from collections import Counter
 
-# Use the NEW Video Dataset
-from src.datasets.video_deepfake_dataset import VideoDeepfakeDataset
+# Use the NEW FFPP Video Dataset
+from src.datasets.ffpp_video_dataset import FFPPVideoDataset
 # Use the existing EfficientNet_LSTM model
 from src.models.efficientnet_lstm import EfficientNet_LSTM
 
@@ -21,11 +21,13 @@ CONFIG = {
     "batch_size": 8, # Reduced batch size due to memory constraints with video frames
     "num_workers": 2,
     "learning_rate": 1e-4, # Might need adjustment for video
-    "epochs": 10,
+    "epochs": 50,
     "patience": 5,
-    "num_frames": 16 # Number of frames to sample per video
+    "num_frames": 16, # Number of frames to sample per video
+    "ffpp_root_dir": "data/ffpp" # Set the correct root directory
 }
 
+# --- train_one_epoch and validate functions remain the same ---
 def train_one_epoch(model, loader, optimizer, criterion, scaler):
     """Trains the model for one epoch using video frame sequences."""
     model.train()
@@ -75,32 +77,68 @@ def validate(model, loader, criterion):
 if __name__ == "__main__":
     print(f"Using device: {CONFIG['device']}")
 
-    # --- Video Frame Transformations (Matching Previous Successful Training) ---
+    # --- Video Frame Transformations (Matching Previous Successful Image Training - ONLY ToTensor) ---
     video_transforms = transforms.Compose([
         transforms.ToTensor(), # Input to this is now a NumPy array (HWC) from OpenCV
         # transforms.Resize((224, 224), antialias=True), # Commented out
         # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), # Commented out
     ])
 
-    # --- Datasets ---
+    # --- Datasets (Using FFPPVideoDataset) ---
     try:
-        train_set = VideoDeepfakeDataset("data/train", num_frames=CONFIG["num_frames"], transform=video_transforms)
-        val_set   = VideoDeepfakeDataset("data/val", num_frames=CONFIG["num_frames"], transform=video_transforms)
+        # Pass the correct root directory and specify 'train' split
+        train_set = FFPPVideoDataset(CONFIG["ffpp_root_dir"], num_frames=CONFIG["num_frames"], transform=video_transforms, split='train')
+        # Pass the correct root directory and specify 'val' split
+        val_set   = FFPPVideoDataset(CONFIG["ffpp_root_dir"], num_frames=CONFIG["num_frames"], transform=video_transforms, split='val')
     except RuntimeError as e:
         print(f"\n---!!! Dataset Loading Error !!!---")
         print(f"Error: {e}")
-        print("Please ensure your 'data/train' and 'data/val' folders contain 'real' and 'fake' subdirectories with video files (.mp4, .avi, .mov).")
+        print(f"Please ensure your '{CONFIG['ffpp_root_dir']}' folder contains the expected FFPP structure (original_sequences, manipulated_sequences).")
+        exit(1)
+    except FileNotFoundError as e:
+        print(f"\n---!!! Dataset Loading Error !!!---")
+        print(f"Error: {e}")
+        print(f"Could not find the root directory specified: '{CONFIG['ffpp_root_dir']}'. Please check the path.")
         exit(1)
 
-    # --- DataLoaders ---
-    # NOTE: Oversampling (WeightedRandomSampler) is not included here initially.
-    # Add it back if your video dataset is significantly imbalanced.
-    # Check balance first:
-    train_labels = [label for _, label in train_set.samples]
-    print(f"Training video class counts: {Counter(train_labels)}")
 
-    train_loader = DataLoader(train_set, batch_size=CONFIG["batch_size"], shuffle=True, num_workers=CONFIG["num_workers"], pin_memory=True)
-    val_loader   = DataLoader(val_set, batch_size=CONFIG["batch_size"], shuffle=False, num_workers=CONFIG["num_workers"], pin_memory=True)
+    # --- Check for Imbalance & Apply Oversampling if needed ---
+    train_labels = [label for _, label in train_set.samples]
+    class_counts = Counter(train_labels)
+    print(f"Training video class counts: {class_counts}")
+
+    sampler = None # Initialize sampler to None
+    # Example: Apply oversampling if one class is less than 80% the size of the other
+    majority_count = max(class_counts.values()) if class_counts else 0
+    minority_count = min(class_counts.values()) if class_counts else 0
+    if majority_count > 0 and minority_count > 0 and minority_count < 0.8 * majority_count:
+        print("Applying oversampling due to class imbalance.")
+        class_weights = {label: 1.0 / count for label, count in class_counts.items()}
+        sample_weights = [class_weights[label] for label in train_labels]
+        sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+    else:
+        print("Dataset is reasonably balanced or empty, not applying oversampling.")
+
+
+    # --- DataLoaders ---
+    # Use sampler if defined, otherwise shuffle=True
+    train_loader = DataLoader(
+        train_set,
+        batch_size=CONFIG["batch_size"],
+        sampler=sampler, # Pass sampler here
+        shuffle=(sampler is None), # Only shuffle if sampler is not used
+        num_workers=CONFIG["num_workers"],
+        pin_memory=True,
+        # persistent_workers=True if CONFIG["num_workers"] > 0 else False # Can speed up loading
+    )
+    val_loader   = DataLoader(
+        val_set,
+        batch_size=CONFIG["batch_size"],
+        shuffle=False,
+        num_workers=CONFIG["num_workers"],
+        pin_memory=True,
+        # persistent_workers=True if CONFIG["num_workers"] > 0 else False
+    )
 
     # --- Model, Loss, Optimizer ---
     model = EfficientNet_LSTM().to(CONFIG["device"])
@@ -109,23 +147,25 @@ if __name__ == "__main__":
 
     # --- Performance Boosters ---
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3)
-    scaler = GradScaler() # For Mixed Precision if using GPU
+    # Ensure scaler is only enabled when using CUDA
+    scaler = GradScaler(enabled=(CONFIG["device"].type == 'cuda'))
 
     # --- Training Loop with Early Stopping ---
     best_val_loss = float('inf')
     epochs_no_improve = 0
     
-    print(f"\nStarting video training for {CONFIG['epochs']} epochs...")
+    print(f"\nStarting FFPP video training for {CONFIG['epochs']} epochs...")
     for epoch in range(CONFIG["epochs"]):
+        # Pass scaler correctly, even if on CPU (it will be disabled)
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler)
-        val_loss, val_acc = validate(model, val_loader, criterion)
+        # Pass scaler to validate function if autocast is used there too
+        val_loss, val_acc = validate(model, val_loader, criterion) # Assuming validate doesn't use scaler
         print(f"Epoch {epoch+1}/{CONFIG['epochs']} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%")
         scheduler.step(val_loss)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_no_improve = 0
-            # Save the video-trained model with a different name
             torch.save(model.state_dict(), "best_video_model.pth")
             print(f"-> Validation loss improved. Saving model to best_video_model.pth")
         else:
@@ -136,4 +176,4 @@ if __name__ == "__main__":
             break
 
     print(f"Video training complete. Best model saved to best_video_model.pth")
-      
+
