@@ -16,7 +16,7 @@ class FFPPVideoDataset(Dataset):
             root_dir (string): Root directory of the FFPP dataset (e.g., 'data/ffpp').
             num_frames (int): Number of frames to sample from each video.
             transform (callable, optional): Optional transform to be applied on frames.
-            split (string): 'train' or 'val' to select the dataset split.
+            split (string): 'train', 'val', or 'test' to select the dataset split.
             ratio (float): Train/validation split ratio (default: 0.8 for train).
         """
         self.root_dir = root_dir
@@ -42,21 +42,30 @@ class FFPPVideoDataset(Dataset):
                         if filename.lower().endswith(self.video_extensions):
                             original_paths.append(os.path.join(dirpath, filename))
 
-        # Find all manipulated videos (Label 1) - focusing on Deepfakes for now
+        # --- FIX: Load ALL manipulated video types (Label 1) ---
         manipulated_paths = []
-        manipulated_root = os.path.join(self.root_dir, 'manipulated_sequences/Deepfakes')
-        if not os.path.isdir(manipulated_root):
-             print(f"Warning: Manipulated sequences directory not found - {manipulated_root}")
-        else:
+        fake_types = ['Deepfakes', 'Face2Face', 'FaceSwap', 'NeuralTextures']
+        
+        print(f"Searching for manipulated video types: {fake_types}")
+
+        for fake_type in fake_types:
+            manipulated_root = os.path.join(self.root_dir, 'manipulated_sequences', fake_type)
+            
+            if not os.path.isdir(manipulated_root):
+                 print(f"Warning: Directory not found, skipping - {manipulated_root}")
+                 continue # Skip this fake type if the folder doesn't exist
+            
+            print(f"Loading from: {manipulated_root}")
             for dirpath, dirnames, filenames in os.walk(manipulated_root):
                  if os.path.basename(dirpath) == 'videos':
                     for filename in filenames:
                         if filename.lower().endswith(self.video_extensions):
                             manipulated_paths.append(os.path.join(dirpath, filename))
+        # --- END OF FIX ---
 
         print(f"Found {len(original_paths)} original videos and {len(manipulated_paths)} manipulated videos.")
 
-        # --- Create Train/Validation Split ---
+        # --- Create Train/Validation/Test Split ---
         random.seed(42) # for reproducible splits
         random.shuffle(original_paths)
         random.shuffle(manipulated_paths)
@@ -69,15 +78,27 @@ class FFPPVideoDataset(Dataset):
             train_manipulated = manipulated_paths[:manip_split_idx]
             self.samples.extend([(p, 0) for p in train_originals])
             self.samples.extend([(p, 1) for p in train_manipulated])
+            
         elif self.split == 'val':
             val_originals = original_paths[orig_split_idx:]
             val_manipulated = manipulated_paths[manip_split_idx:]
             self.samples.extend([(p, 0) for p in val_originals])
             self.samples.extend([(p, 1) for p in val_manipulated])
+            
+        elif self.split == 'test':
+            # This implementation assumes the 'test' set is the same as the 'val' set
+            # (i.e., the data not used for training)
+            test_originals = original_paths[orig_split_idx:]
+            test_manipulated = manipulated_paths[manip_split_idx:]
+            self.samples.extend([(p, 0) for p in test_originals])
+            self.samples.extend([(p, 1) for p in test_manipulated])
+            
         else:
-            raise ValueError(f"Invalid split name: {self.split}. Choose 'train' or 'val'.")
+            raise ValueError(f"Invalid split name: {self.split}. Choose 'train', 'val', or 'test'.")
 
-        random.shuffle(self.samples) # Shuffle combined list
+        # Shuffle combined list for good measure, though sampler handles train
+        if self.split == 'train':
+            random.shuffle(self.samples) 
 
         print(f"Loaded {len(self.samples)} samples for the '{self.split}' split.")
         if len(self.samples) == 0:
@@ -93,6 +114,7 @@ class FFPPVideoDataset(Dataset):
 
         # Apply transformations if provided
         if self.transform:
+            # Apply transform to each frame and stack them
             frames = torch.stack([self.transform(frame) for frame in frames])
 
         # Expected output shape: [num_frames, C, H, W]
@@ -100,12 +122,12 @@ class FFPPVideoDataset(Dataset):
 
     def _sample_frames(self, video_path):
         """Samples 'num_frames' evenly spaced frames from the video."""
-        # --- Frame sampling logic remains the same as VideoDeepfakeDataset ---
         frames = []
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             print(f"Error opening video file: {video_path}")
-            return [np.zeros((100, 100, 3), dtype=np.uint8)] * self.num_frames # Placeholder
+            # Return a placeholder black frame
+            return [np.zeros((100, 100, 3), dtype=np.uint8)] * self.num_frames 
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if total_frames < 1: # Handle empty or corrupt video
@@ -114,6 +136,7 @@ class FFPPVideoDataset(Dataset):
 
         # Ensure num_frames is not greater than total_frames
         num_to_sample = min(self.num_frames, total_frames)
+        # Get evenly spaced indices
         indices = np.linspace(0, total_frames - 1, num_to_sample, dtype=int)
 
         frame_idx = 0
@@ -121,13 +144,16 @@ class FFPPVideoDataset(Dataset):
         processed_indices = set() # To avoid duplicates if indices are close
 
         while sampled_count < num_to_sample:
-            ret = cap.grab()
+            ret = cap.grab() # Grab frame header
             if not ret:
-                 if frames:
-                     while len(frames) < self.num_frames: frames.append(frames[-1])
-                 else:
-                     frames = [np.zeros((100, 100, 3), dtype=np.uint8)] * self.num_frames
-                 break
+                # End of video or error
+                if frames:
+                    # Pad with last good frame
+                    while len(frames) < self.num_frames: frames.append(frames[-1])
+                else:
+                    # No frames read, pad with zeros
+                    frames = [np.zeros((100, 100, 3), dtype=np.uint8)] * self.num_frames
+                break
 
             # Check if current frame index is one we need to sample
             is_target_frame = False
@@ -139,14 +165,16 @@ class FFPPVideoDataset(Dataset):
                     break
 
             if is_target_frame:
-                ret, frame = cap.retrieve()
+                ret, frame = cap.retrieve() # Decode the grabbed frame
                 if ret:
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     frames.append(frame_rgb)
                     processed_indices.add(target_idx)
                     sampled_count += 1
                 else:
+                    # Failed to retrieve frame
                     print(f"Warning: Could not retrieve frame {frame_idx} from {video_path}")
+                    # Pad with last good frame if available, else pad with zeros
                     if frames: frames.append(frames[-1])
                     else: frames.append(np.zeros((100,100,3), dtype=np.uint8))
                     processed_indices.add(target_idx) # Mark as processed even if failed
@@ -160,10 +188,11 @@ class FFPPVideoDataset(Dataset):
 
         cap.release()
 
-        # Pad if needed (e.g., if video was shorter than num_frames)
+        # Pad if needed (e.g., if video was shorter than num_frames or read failed)
         while len(frames) < self.num_frames:
-            if frames: frames.append(frames[-1])
-            else: frames.append(np.zeros((100,100,3), dtype=np.uint8))
+            if frames: frames.append(frames[-1]) # Pad with last frame
+            else: frames.append(np.zeros((100,100,3), dtype=np.uint8)) # Pad with zeros
 
         # Ensure exactly num_frames are returned
         return frames[:self.num_frames]
+
