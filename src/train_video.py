@@ -23,8 +23,8 @@ CONFIG = {
     "learning_rate": 1e-4, 
     
     # --- LONGER TRAINING ---
-    "epochs": 30, 
-    "patience": 10, # Give it time to learn
+    "epochs": 50, 
+    "patience": 15, # Give it time to learn
     
     "num_frames": 16,
     "ffpp_root_dir": "data/ffpp_frames" 
