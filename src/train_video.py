@@ -20,7 +20,8 @@ CONFIG = {
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     "batch_size": 8,
     "num_workers": 4, 
-    "learning_rate": 1e-4, 
+    # --- FIX: Lower learning rate for Transformer stability ---
+    "learning_rate": 5e-5, # Was 1e-4
     "epochs": 50, 
     "patience": 15,
     "num_frames": 16, 
@@ -134,7 +135,7 @@ if __name__ == "__main__":
     # --- 2. INSTANTIATE THE NEW TRANSFORMER MODEL ---
     model = EfficientNet_Transformer().to(CONFIG["device"])
     
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.BCEWithLogSqueeze()
     
     # --- 3. USE AdamW (OUR CHAMPION SETTING) ---
     optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG["learning_rate"])
