@@ -9,29 +9,26 @@ import warnings
 from collections import Counter
 import os
 
-# --- USE THE FAST FRAME DATASET ---
+# --- 1. IMPORT THE NEW TRANSFORMER MODEL ---
+from src.models.efficientnet_transformer import EfficientNet_Transformer
 from src.datasets.ffpp_frame_dataset import FFPPFrameDataset
-from src.models.efficientnet_lstm import EfficientNet_LSTM # Use the original (no dropout)
 
 warnings.filterwarnings("ignore")
 
-# --- Configuration for our BEST Model ---
+# --- Configuration (Same as our "Champion" run) ---
 CONFIG = {
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     "batch_size": 8,
-    "num_workers": 8,
-    
-    # --- Champion settings ---
+    "num_workers": 4, 
     "learning_rate": 1e-4, 
-    "epochs": 50,     
-    "patience": 15,   
-    
-    "num_frames": 16,
-    "ffpp_root_dir": "data/ffpp_frames", 
-    "model_save_path": "best_video_model_fast.pth"
+    "epochs": 50, 
+    "patience": 15,
+    "num_frames": 16, 
+    "ffpp_root_dir": "data/ffpp_frames",
+    "model_save_path": "best_transformer_model.pth" # New save path
 }
 
-# --- train_one_epoch and validate functions (no changes) ---
+# --- train_one_epoch and validate functions remain identical ---
 def train_one_epoch(model, loader, optimizer, criterion, scaler):
     model.train()
     total_loss = 0
@@ -59,17 +56,16 @@ def train_one_epoch(model, loader, optimizer, criterion, scaler):
 def validate(model, loader, criterion):
     model.eval()
     val_loss, correct, total = 0, 0, 0
-    loop = tqdm(loader, leave=True, desc="Validating")
     with torch.no_grad():
-        for frame_sequences, labels in loop:
+        for frame_sequences, labels in loader:
             frame_sequences, labels = frame_sequences.to(CONFIG["device"]), labels.float().to(CONFIG["device"])
             with autocast(enabled=(CONFIG["device"].type == 'cuda')):
                 outputs = model(frame_sequences)
                 loss = criterion(outputs.squeeze(-1), labels) 
 
             val_loss += loss.item()
-            preds = (torch.sigmoid(outputs) > 0.5).int().squeeze(-1)
-            correct += (preds == labels.int()).sum().item()
+            preds = (torch.sigmoid(outputs) > 0.5).int().squeeze(-1) 
+            correct += (preds == labels.int()).sum().item() 
             total += labels.size(0)
 
     avg_loss = val_loss / len(loader) if len(loader) > 0 else 1
@@ -81,13 +77,12 @@ if __name__ == "__main__":
     print(f"Using device: {CONFIG['device']}")
     print(f"Loading data from: {CONFIG['ffpp_root_dir']}")
 
-    # --- Use SIMPLE Augmentations (from our best model) ---
+    # --- Use our "Champion" simple augmentations ---
     train_transforms = transforms.Compose([
-        # Standard augmentations that led to our best score
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2), # Simple color change
         transforms.ToTensor(),
+        transforms.RandomHorizontalFlip(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
     ])
     
     val_transforms = transforms.Compose([
@@ -102,22 +97,22 @@ if __name__ == "__main__":
     except RuntimeError as e:
         print(f"\n---!!! Dataset Loading Error !!!---")
         print(f"Error: {e}")
+        print(f"Please ensure your '{CONFIG['ffpp_root_dir']}' folder contains the pre-processed frames.")
         exit(1)
 
-
-    # --- Oversampling ---
+    # --- WeightedRandomSampler for Imbalance ---
     train_labels = [label for _, label in train_set.samples]
     class_counts = Counter(train_labels)
     print(f"Training frame class counts: {class_counts}")
 
     sampler = None
-    if class_counts and class_counts[0] > 0 and class_counts[1] > 0:
+    if class_counts[0] > 0 and class_counts[1] > 0:
         print("Applying weighted random oversampler to training set.")
         class_weights = {label: 1.0 / count for label, count in class_counts.items()}
         sample_weights = [class_weights[label] for label in train_labels]
         sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
     else:
-        print("Dataset is imbalanced or one class is missing. Not applying oversampling.")
+        print("Dataset is imbalanced or empty, not applying oversampling.")
 
     # --- DataLoaders ---
     train_loader = DataLoader(
@@ -136,22 +131,22 @@ if __name__ == "__main__":
         pin_memory=True,
     )
 
-    # --- Model, Loss, Optimizer (AdamW) ---
-    model = EfficientNet_LSTM().to(CONFIG["device"])
+    # --- 2. INSTANTIATE THE NEW TRANSFORMER MODEL ---
+    model = EfficientNet_Transformer().to(CONFIG["device"])
+    
     criterion = nn.BCEWithLogitsLoss()
     
-    # --- Use AdamW (our champion optimizer) ---
+    # --- 3. USE AdamW (OUR CHAMPION SETTING) ---
     optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG["learning_rate"])
 
-    # --- Schedulers ---
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=7) 
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
     scaler = GradScaler(enabled=(CONFIG["device"].type == 'cuda'))
 
-    # --- Training Loop ---
+    # --- Training Loop with Early Stopping ---
     best_val_loss = float('inf')
     epochs_no_improve = 0
     
-    print(f"\nStarting FAST training for {CONFIG['epochs']} epochs...")
+    print(f"\nStarting TRANSFORMER training for {CONFIG['epochs']} epochs...")
     for epoch in range(CONFIG["epochs"]):
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler)
         val_loss, val_acc = validate(model, val_loader, criterion)
