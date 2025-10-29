@@ -3,33 +3,32 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torchvision import transforms
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler, autocast # Re-enabled for LSTM
 from tqdm import tqdm
 import warnings
 from collections import Counter
 import os
 
-# --- 1. IMPORT THE NEW TRANSFORMER MODEL ---
-from src.models.efficientnet_transformer import EfficientNet_Transformer
+# --- USE THE ORIGINAL LSTM MODEL ---
+from src.models.efficientnet_lstm import EfficientNet_LSTM 
 from src.datasets.ffpp_frame_dataset import FFPPFrameDataset
 
 warnings.filterwarnings("ignore")
 
-# --- Configuration (Same as our "Champion" run) ---
+# --- Configuration for BEST LSTM MODEL ---
 CONFIG = {
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     "batch_size": 8,
     "num_workers": 4, 
-    # --- FIX: Lower learning rate for Transformer stability ---
-    "learning_rate": 5e-5, # Was 1e-4
-    "epochs": 50, 
-    "patience": 15,
+    "learning_rate": 1e-4, # Original LR
+    "epochs": 50,          # Longer training
+    "patience": 15,         # Longer patience
     "num_frames": 16, 
     "ffpp_root_dir": "data/ffpp_frames",
-    "model_save_path": "best_transformer_model.pth" # New save path
+    "model_save_path": "best_lstm_model.pth" # Clearer name
 }
 
-# --- train_one_epoch and validate functions remain identical ---
+# --- Train/Validate with Autocast enabled ---
 def train_one_epoch(model, loader, optimizer, criterion, scaler):
     model.train()
     total_loss = 0
@@ -57,8 +56,9 @@ def train_one_epoch(model, loader, optimizer, criterion, scaler):
 def validate(model, loader, criterion):
     model.eval()
     val_loss, correct, total = 0, 0, 0
+    loop = tqdm(loader, leave=True, desc="Validating") 
     with torch.no_grad():
-        for frame_sequences, labels in loader:
+        for frame_sequences, labels in loop:
             frame_sequences, labels = frame_sequences.to(CONFIG["device"]), labels.float().to(CONFIG["device"])
             with autocast(enabled=(CONFIG["device"].type == 'cuda')):
                 outputs = model(frame_sequences)
@@ -78,7 +78,7 @@ if __name__ == "__main__":
     print(f"Using device: {CONFIG['device']}")
     print(f"Loading data from: {CONFIG['ffpp_root_dir']}")
 
-    # --- Use our "Champion" simple augmentations ---
+    # --- Simple Augmentations ---
     train_transforms = transforms.Compose([
         transforms.ToTensor(),
         transforms.RandomHorizontalFlip(),
@@ -91,64 +91,53 @@ if __name__ == "__main__":
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    # --- Datasets ---
     try:
         train_set = FFPPFrameDataset(CONFIG["ffpp_root_dir"], num_frames=CONFIG["num_frames"], transform=train_transforms, split='train')
         val_set   = FFPPFrameDataset(CONFIG["ffpp_root_dir"], num_frames=CONFIG["num_frames"], transform=val_transforms, split='val')
     except RuntimeError as e:
         print(f"\n---!!! Dataset Loading Error !!!---")
         print(f"Error: {e}")
-        print(f"Please ensure your '{CONFIG['ffpp_root_dir']}' folder contains the pre-processed frames.")
         exit(1)
 
-    # --- WeightedRandomSampler for Imbalance ---
     train_labels = [label for _, label in train_set.samples]
     class_counts = Counter(train_labels)
     print(f"Training frame class counts: {class_counts}")
 
     sampler = None
-    if class_counts[0] > 0 and class_counts[1] > 0:
+    if class_counts.get(0, 0) > 0 and class_counts.get(1, 0) > 0:
         print("Applying weighted random oversampler to training set.")
         class_weights = {label: 1.0 / count for label, count in class_counts.items()}
         sample_weights = [class_weights[label] for label in train_labels]
         sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
     else:
-        print("Dataset is imbalanced or empty, not applying oversampling.")
+        print("Dataset is imbalanced or empty.")
 
-    # --- DataLoaders ---
     train_loader = DataLoader(
-        train_set,
-        batch_size=CONFIG["batch_size"],
-        sampler=sampler,
-        shuffle=(sampler is None),
-        num_workers=CONFIG["num_workers"],
-        pin_memory=True,
+        train_set, batch_size=CONFIG["batch_size"], sampler=sampler,
+        shuffle=(sampler is None), num_workers=CONFIG["num_workers"], pin_memory=True,
     )
     val_loader   = DataLoader(
-        val_set,
-        batch_size=CONFIG["batch_size"],
-        shuffle=False,
-        num_workers=CONFIG["num_workers"],
-        pin_memory=True,
+        val_set, batch_size=CONFIG["batch_size"], shuffle=False,
+        num_workers=CONFIG["num_workers"], pin_memory=True,
     )
 
-    # --- 2. INSTANTIATE THE NEW TRANSFORMER MODEL ---
-    model = EfficientNet_Transformer().to(CONFIG["device"])
+    # --- USE LSTM MODEL ---
+    model = EfficientNet_LSTM().to(CONFIG["device"])
     
-    criterion = nn.BCEWithLogSqueeze()
+    criterion = nn.BCEWithLogitsLoss()
     
-    # --- 3. USE AdamW (OUR CHAMPION SETTING) ---
+    # --- USE AdamW ---
     optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG["learning_rate"])
-
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5) # Original patience was 5
+    
+    # --- Use GradScaler for LSTM ---
     scaler = GradScaler(enabled=(CONFIG["device"].type == 'cuda'))
 
-    # --- Training Loop with Early Stopping ---
     best_val_loss = float('inf')
     epochs_no_improve = 0
     
-    print(f"\nStarting TRANSFORMER training for {CONFIG['epochs']} epochs...")
-    for epoch in range(CONFIG["epochs"]):
+    print(f"\nStarting LSTM training for {CONFIG['epochs']} epochs...")
+    for epoch in range(CONFIG['epochs']):
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler)
         val_loss, val_acc = validate(model, val_loader, criterion)
         print(f"Epoch {epoch+1}/{CONFIG['epochs']} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%")
@@ -166,5 +155,5 @@ if __name__ == "__main__":
             print(f"Early stopping triggered after {CONFIG['patience']} epochs with no improvement.")
             break
 
-    print(f"Fast training complete. Best model saved to {CONFIG['model_save_path']}")
+    print(f"Training complete. Best model saved to {CONFIG['model_save_path']}")
 

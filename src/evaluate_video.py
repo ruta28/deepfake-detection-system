@@ -4,28 +4,28 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
 import warnings
+# --- Make sure scikit-learn is installed! ---
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
 import os
 
-# --- 1. IMPORT THE NEW TRANSFORMER MODEL ---
-from src.models.efficientnet_transformer import EfficientNet_Transformer
+# --- USE THE ORIGINAL LSTM MODEL ---
+from src.models.efficientnet_lstm import EfficientNet_LSTM
 from src.datasets.ffpp_frame_dataset import FFPPFrameDataset
 
 warnings.filterwarnings("ignore")
 
-# --- Configuration ---
+# --- Configuration for BEST LSTM MODEL ---
 CONFIG = {
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-    "batch_size": 16, 
+    "batch_size": 16,
     "num_workers": 4,
-    "ffpp_root_dir": "data/ffpp_frames", 
+    "ffpp_root_dir": "data/ffpp_frames",
     "num_frames": 16,
-    
-    # --- 2. LOAD THE NEW TRANSFORMER MODEL ---
-    "model_path": "best_transformer_model.pth" 
+    "model_path": "best_lstm_model.pth", # Load LSTM model
+    "results_path": "test_lstm_confusion_matrix.png" # New results path
 }
 
 def evaluate_model(model, loader, criterion):
@@ -33,51 +33,54 @@ def evaluate_model(model, loader, criterion):
     model.eval()
     all_labels = []
     all_probs = [] # Store probabilities, not predictions
-    
+
     loop = tqdm(loader, leave=True, desc="Evaluating")
     with torch.no_grad():
         for frame_sequences, labels in loop:
             frame_sequences, labels = frame_sequences.to(CONFIG["device"]), labels.float().to(CONFIG["device"])
-            
+
+            # --- Use Autocast for LSTM eval ---
             with torch.cuda.amp.autocast(enabled=(CONFIG["device"].type == 'cuda')):
                 outputs = model(frame_sequences)
-            
+
             probs = torch.sigmoid(outputs).squeeze(-1)
-            
             all_labels.extend(labels.cpu().numpy())
             all_probs.extend(probs.cpu().numpy())
 
     all_labels = np.array(all_labels)
     all_probs = np.array(all_probs)
 
-    # --- Find the Best F1-Score Threshold (Robust Method) ---
-    thresholds = np.linspace(0.01, 0.99, 100)
+    # --- Robust Threshold Tuning ---
+    thresholds = np.linspace(0.01, 0.99, 100) # Test 100 thresholds
     f1_scores = []
 
+    # Calculate F1 for each threshold
     for t in thresholds:
         preds = (all_probs > t).astype(int)
+        # Calculate F1 specifically for the 'fake' class (label 1)
         f1 = f1_score(all_labels, preds, pos_label=1, zero_division=0)
         f1_scores.append(f1)
-    
+
+    # Find the threshold that gives the best F1 score
     best_f1_idx = np.argmax(f1_scores)
     best_threshold = thresholds[best_f1_idx]
     best_f1 = f1_scores[best_f1_idx]
-    
+
     print(f"\n--- Threshold Analysis ---")
-    
+
     # --- Get stats for the DEFAULT (0.5) threshold ---
     preds_0_5 = (all_probs > 0.5).astype(int)
     report_0_5 = classification_report(all_labels, preds_0_5, target_names=['Real (0)', 'Fake (1)'], output_dict=True, zero_division=0)
     default_f1 = report_0_5.get('Fake (1)', {}).get('f1-score', 0)
     print(f"Default (0.5) F1 Score: {default_f1:.4f}")
-    
+
     print(f"Best F1 Score ({best_f1:.4f}) found at threshold: {best_threshold:.4f}")
-    
+
     # --- Get stats for the NEW BEST threshold ---
     best_preds = (all_probs > best_threshold).astype(int)
     best_report = classification_report(all_labels, best_preds, target_names=['Real (0)', 'Fake (1)'], output_dict=True, zero_division=0)
     best_cm = confusion_matrix(all_labels, best_preds)
-    
+
     return best_report, best_cm, report_0_5
 
 
@@ -92,10 +95,8 @@ if __name__ == "__main__":
 
     try:
         test_set = FFPPFrameDataset(
-            CONFIG["ffpp_root_dir"], 
-            num_frames=CONFIG["num_frames"], 
-            transform=eval_transforms,
-            split='test'
+            CONFIG["ffpp_root_dir"], num_frames=CONFIG["num_frames"],
+            transform=eval_transforms, split='test'
         )
     except RuntimeError as e:
         print(f"\n---!!! Dataset Loading Error !!!---")
@@ -107,17 +108,15 @@ if __name__ == "__main__":
         exit(1)
 
     test_loader = DataLoader(
-        test_set,
-        batch_size=CONFIG["batch_size"],
-        shuffle=False,
-        num_workers=CONFIG["num_workers"],
-        pin_memory=True,
+        test_set, batch_size=CONFIG["batch_size"], shuffle=False,
+        num_workers=CONFIG["num_workers"], pin_memory=True,
     )
 
-    # --- 3. INSTANTIATE THE NEW TRANSFORMER MODEL ---
-    model = EfficientNet_Transformer().to(CONFIG["device"])
-    
+    # --- LOAD LSTM MODEL ---
+    model = EfficientNet_LSTM().to(CONFIG["device"])
+
     try:
+        # Load the saved weights
         model.load_state_dict(torch.load(CONFIG["model_path"], map_location=CONFIG["device"]))
     except FileNotFoundError:
         print(f"Error: Model file not found at {CONFIG['model_path']}")
@@ -125,14 +124,14 @@ if __name__ == "__main__":
     except RuntimeError as e:
         print(f"---!!! Model Load Error !!!---")
         print(f"Error: {e}")
-        print("This can happen if you are trying to load an old (LSTM) model.")
         exit(1)
-        
-    criterion = nn.BCEWithLogitsLoss() 
+
+    criterion = nn.BCEWithLogitsLoss() # Not strictly needed for eval metrics, but good practice
 
     print(f"Running evaluation on {len(test_set)} test samples...")
     best_report, best_cm, report_0_5 = evaluate_model(model, test_loader, criterion)
 
+    # Extract metrics for the 'Fake' class
     fake_metrics_0_5 = report_0_5.get('Fake (1)', {})
     fake_metrics_best = best_report.get('Fake (1)', {})
 
@@ -141,7 +140,7 @@ if __name__ == "__main__":
     print(f"Recall (Fake):    {fake_metrics_0_5.get('recall', 0):.4f}")
     print(f"F1 Score (Fake):  {fake_metrics_0_5.get('f1-score', 0):.4f}")
     print("---")
-    
+
     print(f"--- BEST Tuned Threshold Results ---")
     print(f"Test Accuracy: {best_report['accuracy'] * 100:.2f}%")
     print(f"Precision (Fake): {fake_metrics_best.get('precision', 0):.4f}")
@@ -151,13 +150,14 @@ if __name__ == "__main__":
 
     print("Generating Confusion Matrix for *Best* Threshold...")
     plt.figure(figsize=(10, 7))
-    sns.heatmap(best_cm, annot=True, fmt='d', cmap='Blues', 
+    sns.heatmap(best_cm, annot=True, fmt='d', cmap='Blues',
                 xticklabels=['Predicted Real (0)', 'Predicted Fake (1)'],
                 yticklabels=['Actual Real (0)', 'Actual Fake (1)'])
     plt.title('Test Set Confusion Matrix (Tuned Threshold)')
     plt.ylabel('Actual')
     plt.xlabel('Predicted')
-    
-    save_path = "test_transformer_confusion_matrix.png"
+
+    save_path = CONFIG['results_path']
     plt.savefig(save_path)
     print(f"Confusion Matrix plot saved to {save_path}")
+
