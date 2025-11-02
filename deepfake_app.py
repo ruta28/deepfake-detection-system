@@ -24,16 +24,21 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as Re
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 
-# --- CHANGE: Import the SINGLE model class from its correct file ---
+# --- Import BOTH model classes from their correct files ---
+# (This requires src/__init__.py and src/models/__init__.py to exist)
 from src.models.efficientnet_lstm import EfficientNet_LSTM
+from src.models.static_image_model import StaticImageModel
 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", message="Unable to retrieve source code")
 
 
 # --- Configuration ---
-IMAGE_MODEL_WEIGHTS = "best_model_finetuned_image.pth" # Your image model
-VIDEO_MODEL_WEIGHTS = "best_model_finetuned_video.pth" # Your video model
+IMAGE_MODEL_WEIGHTS = "best_static_image_model.pth" # Your NEW image model
+VIDEO_MODEL_WEIGHTS = "best_video_model_fast.pth"  # Your best video model
+# --- CHANGE: This threshold means "scores *below* this are FAKE" ---
+IMAGE_THRESHOLD = 0.0199 # The best threshold from your last evaluation
+VIDEO_THRESHOLD = 0.5    # Default for video model
 
 UPLOAD_FOLDER = 'static/uploads'
 RESULTS_FOLDER = 'static/results'
@@ -46,14 +51,17 @@ app = Flask(__name__)
 image_model = None
 video_model = None
 
-# --- Transforms ---
+# --- Transforms (Must match what each model was trained on) ---
+# Transforms for the new static image model
 image_transforms = transforms.Compose([
-    transforms.Resize((224, 224), antialias=True), 
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
+# Transforms for the video model (trained on ffpp_frames)
 video_frame_transforms = transforms.Compose([
-    transforms.Resize((224, 224), antialias=True),
+    transforms.Resize((224, 224), antialias=True), # Match your old app's video transforms
     transforms.ToTensor(), 
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
@@ -66,6 +74,7 @@ def allowed_file(filename):
 def is_video_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'mp4', 'avi', 'mov'}
 
+# --- Updated load_model function to load BOTH models ---
 def load_models():
     global image_model, video_model
     
@@ -74,8 +83,8 @@ def load_models():
         if not os.path.exists(IMAGE_MODEL_WEIGHTS):
             raise FileNotFoundError(f"Image model weights not found at {IMAGE_MODEL_WEIGHTS}.")
         print(f"Loading IMAGE model from {IMAGE_MODEL_WEIGHTS} onto {DEVICE}...")
-        image_model = EfficientNet_LSTM().to(DEVICE) # Use the LSTM class
-        image_model.load_state_dict(torch.load(IMAGE_MODEL_WEIGHTS, map_location=DEVICE))
+        image_model = StaticImageModel().to(DEVICE)
+        image_model.load_state_dict(torch.load(IMAGE_MODEL_WEIGHTS, map_location=DEVICE, weights_only=True))
         image_model.eval()
         print("Image model loaded successfully.")
     except Exception as e:
@@ -87,45 +96,41 @@ def load_models():
         if not os.path.exists(VIDEO_MODEL_WEIGHTS):
             raise FileNotFoundError(f"Video model weights not found at {VIDEO_MODEL_WEIGHTS}.")
         print(f"Loading VIDEO model from {VIDEO_MODEL_WEIGHTS} onto {DEVICE}...")
-        video_model = EfficientNet_LSTM().to(DEVICE) # Use the LSTM class
-        video_model.load_state_dict(torch.load(VIDEO_MODEL_WEIGHTS, map_location=DEVICE))
+        video_model = EfficientNet_LSTM().to(DEVICE)
+        video_model.load_state_dict(torch.load(VIDEO_MODEL_WEIGHTS, map_location=DEVICE, weights_only=True))
         video_model.eval()
         print("Video model loaded successfully.")
     except Exception as e:
         print(f"FATAL ERROR loading VIDEO model: {e}")
         video_model = None # Set to None if loading fails
 
-# --- 5D TENSOR FIX 1 ---
+# --- Updated generate_heatmap to use the STATIC IMAGE model ---
 def generate_heatmap(input_pil_image, input_tensor_for_model, prob):
-    """
-    input_tensor_for_model is the 4D tensor (1, C, H, W)
-    """
+    # input_tensor_for_model should be 4D: [1, C, H, W]
+    
     if image_model is None:
         print("Heatmap generation failed: Image model not loaded.")
         return None, None
         
-    target_layer_name = 'efficientnet.features.8' 
+    # --- CRITICAL FIX: The correct layer name is 'features.0.8' ---
+    target_layer_name = 'features.0.8' 
     
     heatmap_filename = f"heatmap_{uuid.uuid4()}.png"
     heatmap_save_path = os.path.join(RESULTS_FOLDER, heatmap_filename)
     heatmap_url = f"/results/{heatmap_filename}"
 
     image_model.eval()
-    # --- FIX: Convert 4D tensor (1,C,H,W) to 5D (1,1,C,H,W) for LSTM model ---
-    input_tensor_grad = input_tensor_for_model.unsqueeze(1).clone().detach().requires_grad_(True).to(DEVICE)
+    input_tensor_grad = input_tensor_for_model.clone().detach().requires_grad_(True).to(DEVICE)
 
     try:
         with GradCAM(image_model, target_layer=target_layer_name) as cam_extractor:
-            # Pass the 5D tensor to the model
-            scores = image_model(input_tensor_grad)
-            # Cams will be (1, 1, H, W), squeeze to (H, W)
+            scores = image_model(input_tensor_grad) # Pass 4D tensor
             cams = cam_extractor(class_idx=0, scores=scores)
 
             if not cams or len(cams) == 0:
                 print("Grad-CAM returned no output.")
                 return None, None
 
-            # Squeeze batch and sequence dimensions
             heatmap_tensor = cams[0].squeeze(0).cpu()
 
             if not isinstance(heatmap_tensor, torch.Tensor) or heatmap_tensor.nelement() == 0:
@@ -147,6 +152,7 @@ def generate_heatmap(input_pil_image, input_tensor_for_model, prob):
         traceback.print_exc()
         return None, None
 
+# --- generate_pdf_report (Updated for new confidence logic) ---
 def generate_pdf_report(original_file_path, report_filename, decision, **kwargs):
     report_save_path = os.path.join(RESULTS_FOLDER, report_filename)
     report_url = f"/results/{report_filename}"
@@ -185,14 +191,17 @@ def generate_pdf_report(original_file_path, report_filename, decision, **kwargs)
     story.append(Paragraph(f"Prediction: <font color='{decision_style.textColor}'>{decision}</font>", styles['Normal']))
 
     if 'probability' in kwargs: # Image
-        probability = kwargs['probability']
-        story.append(Paragraph(f"Confidence (Fake): {probability*100:.2f}%", styles['Normal']))
+        # --- CHANGE: PDF now shows the intuitive confidence ---
+        confidence = kwargs['confidence']
+        confidence_label = kwargs['confidence_label']
+        story.append(Paragraph(f"{confidence_label} {confidence:.4f}%", styles['Normal']))
+        
     elif 'confidence' in kwargs: # Video
         confidence = kwargs['confidence']
         frames_processed = kwargs.get('frames_processed', 0)
         fake_frames = kwargs.get('fake_frames', 0)
         fake_percentage = kwargs.get('fake_percentage', 0.0)
-        story.append(Paragraph(f"Overall Confidence: {confidence:.2f}%", styles['Normal']))
+        story.append(Paragraph(f"Overall Confidence: {confidence:.4f}%", styles['Normal']))
         story.append(Spacer(1, 0.1*inch))
         story.append(Paragraph("Video Details:", styles['h3']))
         story.append(Paragraph(f"Frames Analyzed: {frames_processed}", styles['Normal']))
@@ -241,7 +250,7 @@ def generate_pdf_report(original_file_path, report_filename, decision, **kwargs)
 # --- Flask Routes ---
 @app.route('/', methods=['GET'])
 def index():
-    # --- HTML (with scrolling fix) ---
+    # --- HTML (with scrolling fix AND new confidence label) ---
     html_content = """
 <!DOCTYPE html>
 <html lang="en">
@@ -330,7 +339,8 @@ def index():
                          <p id="predictionText" class="text-3xl font-bold"></p>
                      </div>
                      <div>
-                         <p class="text-sm text-gray-500 font-medium uppercase tracking-wider mt-3">Confidence (Fake):</p>
+                         <!-- --- CHANGE: This is the new label for confidence --- -->
+                         <p id="probabilityLabel" class="text-sm text-gray-500 font-medium uppercase tracking-wider mt-3">Confidence:</p>
                          <p id="probabilityText" class="text-xl font-semibold text-gray-900"></p>
                      </div>
                  </div>
@@ -364,7 +374,7 @@ def index():
     </div>
     
     <script>
-        // --- JavaScript (already updated and correct) ---
+        // --- JavaScript (with 4-decimal fix and new label logic) ---
         const uploadForm = document.getElementById('uploadForm');
         const fileUpload = document.getElementById('fileUpload');
         const previewContainer = document.getElementById('previewContainer');
@@ -376,6 +386,8 @@ def index():
         const resultsContainer = document.getElementById('resultsContainer');
         const imageResultLayout = document.getElementById('imageResultLayout');
         const predictionText = document.getElementById('predictionText');
+        // --- CHANGE: Get the new label element ---
+        const probabilityLabel = document.getElementById('probabilityLabel');
         const probabilityText = document.getElementById('probabilityText');
         const heatmapLink = document.getElementById('heatmapLink');
         const heatmapImage = document.getElementById('heatmapImage');
@@ -471,7 +483,7 @@ def index():
                 videoResultLayout.classList.remove('hidden');
 
                 videoPredictionText.textContent = data.decision;
-                videoConfidenceText.textContent = `${data.confidence.toFixed(2)}%`;
+                videoConfidenceText.textContent = `${data.confidence.toFixed(4)}%`;
                 videoDetailsText.textContent = `Analyzed ${data.frames_processed} frames. Found ${data.fake_frames} fake frames (${data.fake_percentage.toFixed(1)}%).`;
 
                 videoPredictionText.classList.remove('result-fake', 'result-real');
@@ -495,9 +507,11 @@ def index():
                 videoResultLayout.classList.add('hidden');
                 imageResultLayout.classList.remove('hidden');
 
-                const probabilityPercent = data.probability * 100;
+                // --- CHANGE: Use new display_prob and display_label ---
                 predictionText.textContent = data.decision;
-                probabilityText.textContent = `${probabilityPercent.toFixed(2)}%`;
+                probabilityLabel.textContent = data.confidence_label; // Set the label
+                probabilityText.textContent = `${data.confidence.toFixed(4)}%`; // Set the number
+                
                 const heatmapSrc = data.heatmap_url && data.heatmap_url !== 'N/A'
                     ? `${data.heatmap_url}?t=${new Date().getTime()}`
                     : 'https://placehold.co/200x200/e2e8f0/64748b?text=No+Heatmap';
@@ -505,16 +519,15 @@ def index():
                 heatmapImage.src = heatmapSrc;
 
                 predictionText.classList.remove('result-fake', 'result-real');
-                probabilityText.classList.remove('text-red-700', 'text-green-700', 'text-orange-600', 'text-yellow-600');
+                probabilityText.classList.remove('text-red-700', 'text-green-700');
                 if (data.decision === 'FAKE') {
                     predictionText.classList.add('result-fake');
-                    if (probabilityPercent > 75) { probabilityText.classList.add('text-red-700'); }
-                    else { probabilityText.classList.add('text-orange-600'); }
+                    probabilityText.classList.add('text-red-700');
                 } else {
                     predictionText.classList.add('result-real');
-                    if (probabilityPercent < 25) { probabilityText.classList.add('text-green-700'); }
-                    else { probabilityText.classList.add('text-yellow-600'); }
+                    probabilityText.classList.add('text-green-700');
                 }
+                // --- END CHANGE ---
 
                 if (data.report_url) {
                     reportLink.href = data.report_url;
@@ -541,7 +554,6 @@ def index():
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    # --- CHANGE: Use the correct model based on file type ---
     if 'file' not in request.files: return jsonify({"error": "No file part"}), 400
     file = request.files['file']
     original_filename = request.form.get('filename', file.filename) 
@@ -570,20 +582,35 @@ def predict():
             os.makedirs(UPLOAD_FOLDER, exist_ok=True)
             with open(upload_save_path, "wb") as f_up: f_up.write(img_bytes)
 
-            # --- CHANGE: Use image_transforms and image_model ---
             input_tensor = image_transforms(img_pil)
-            # --- 5D TENSOR FIX 2 ---
-            # Add batch and sequence dims: (C, H, W) -> (1, 1, C, H, W)
-            input_tensor_model = input_tensor.unsqueeze(0).unsqueeze(0).to(DEVICE) 
+            
+            # --- TENSOR SHAPE FIX: Use 4D for StaticImageModel ---
+            input_tensor_model = input_tensor.unsqueeze(0).to(DEVICE) # Shape: [1, 3, 224, 224]
 
             with torch.no_grad():
-                outputs = image_model(input_tensor_model) # Pass 5D tensor
+                outputs = image_model(input_tensor_model) # Pass 4D tensor
                 prob_tensor = torch.sigmoid(outputs).squeeze()
-                prob = prob_tensor.item()
+                prob = prob_tensor.item() # This is the "real" probability (0=fake, 1=real)
 
-            decision = "FAKE" if prob > 0.5 else "REAL"
-            # --- CHANGE: Pass the 4D tensor to heatmap (1, C, H, W) ---
-            heatmap_abs_path, heatmap_rel_url = generate_heatmap(img_pil, input_tensor.unsqueeze(0), prob)
+            # --- CHANGE: INVERTED LOGIC ---
+            # Model outputs "real" probability. Low score = FAKE.
+            decision = "FAKE" if prob < IMAGE_THRESHOLD else "REAL"
+            
+            # --- CHANGE: Calculate intuitive confidence and label ---
+            display_confidence = 0.0
+            display_label = ""
+            if decision == "FAKE":
+                # Show the fake probability
+                display_confidence = (1.0 - prob) * 100
+                display_label = "Confidence (FAKE):"
+            else:
+                # Show the real probability
+                display_confidence = prob * 100
+                display_label = "Confidence (REAL):"
+            # --- END CHANGE ---
+            
+            # Pass the 4D tensor (1, C, H, W) to heatmap
+            heatmap_abs_path, heatmap_rel_url = generate_heatmap(img_pil, input_tensor_model, prob)
 
             report_filename = f"report_{base_filename}.pdf"
             report_url = generate_pdf_report(
@@ -591,15 +618,21 @@ def predict():
                 report_filename=report_filename,
                 decision=decision,
                 heatmap_image_path=heatmap_abs_path,
-                probability=prob
+                probability=prob, # Send raw prob to PDF
+                # --- CHANGE: Pass new display values to PDF ---
+                confidence=display_confidence,
+                confidence_label=display_label
             )
 
             return jsonify({
                 "is_video": False,
                 "decision": decision,
-                "probability": prob,
+                "probability": prob, # Send raw prob for color logic
                 "heatmap_url": heatmap_rel_url if heatmap_rel_url else "N/A",
-                "report_url": report_url if report_url else None
+                "report_url": report_url if report_url else None,
+                # --- CHANGE: Send new display values to JS ---
+                "confidence": display_confidence,
+                "confidence_label": display_label
             })
 
         else:
@@ -634,10 +667,8 @@ def predict():
                 if current_frame_idx % frame_interval == 0:
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     frame_pil = Image.fromarray(frame_rgb)
-                    # --- CHANGE: Use video_frame_transforms ---
                     input_tensor = video_frame_transforms(frame_pil) 
-                    # --- CHANGE: Use video_model and correct tensor shape (1, 1, C, H, W) ---
-                    # The video model expects a "sequence" of 1 frame
+                    # --- VIDEO MODEL NEEDS 5D TENSOR ---
                     input_tensor_model = input_tensor.unsqueeze(0).unsqueeze(0).to(DEVICE)
 
                     with torch.no_grad():
@@ -654,13 +685,13 @@ def predict():
             if frames_processed == 0:
                  return jsonify({"error": "Could not process any frames from the video."}), 500
 
-            fake_frames = sum(1 for p in frame_predictions if p > 0.5)
+            fake_frames = sum(1 for p in frame_predictions if p > VIDEO_THRESHOLD)
             fake_percentage = (fake_frames / frames_processed) * 100 if frames_processed > 0 else 0
-            overall_decision = "FAKE" if fake_percentage >= 50 else "REAL" 
+            overall_decision = "FAKE" if fake_percentage >= 50 else "REAL" # Use >= 50 for videos
 
             overall_confidence = fake_percentage if overall_decision == "FAKE" else (100.0 - fake_percentage)
 
-            print(f"Video Analysis: Processed={frames_processed}, Fake={fake_frames} ({fake_percentage:.1f}%), Decision={overall_decision}, Confidence={overall_confidence:.2f}%")
+            print(f"Video Analysis: Processed={frames_processed}, Fake={frames_processed} ({fake_percentage:.1f}%), Decision={overall_decision}, Confidence={overall_confidence:.4f}%")
 
             report_filename = f"report_{base_filename}.pdf"
             report_url = generate_pdf_report(
@@ -679,7 +710,7 @@ def predict():
                 "frames_processed": frames_processed,
                 "fake_frames": fake_frames,
                 "fake_percentage": fake_percentage,
-                "confidence": overall_confidence,
+                "confidence": round(overall_confidence, 4),
                 "heatmap_url": "N/A", 
                 "report_url": report_url if report_url else None
             })
@@ -715,7 +746,6 @@ if __name__ == '__main__':
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
     os.makedirs(RESULTS_FOLDER, exist_ok=True)
     try:
-        # --- CHANGE: Call the new function to load BOTH models ---
         load_models()
     except Exception as e:
         print(f"FATAL ERROR during model loading: {e}")
