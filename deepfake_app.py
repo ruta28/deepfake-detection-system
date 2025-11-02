@@ -4,99 +4,58 @@ import uuid
 import warnings
 from PIL import Image
 from datetime import datetime
-import tempfile # For temporarily saving video
-import cv2 # OpenCV for video processing
+import tempfile 
+import cv2 
 import math
 
 import torch
 import torch.nn as nn
 from torchvision import transforms
-from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
 from torchcam.methods import GradCAM
 from torchcam.utils import overlay_mask
-from torchvision.transforms.functional import to_pil_image, to_tensor # Need to_tensor
-# Ensure scikit-image is installed: pip install scikit-image
+from torchvision.transforms.functional import to_pil_image, to_tensor
 from skimage.transform import resize
 
 from flask import Flask, request, jsonify, render_template_string, send_from_directory
 
-# --- PDF Report Generation Imports ---
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as ReportLabImage
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 
+# --- CHANGE: Import the SINGLE model class from its correct file ---
+from src.models.efficientnet_lstm import EfficientNet_LSTM
+
 warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", message="Using a non-default target layer")
-warnings.filterwarnings("ignore", message="Unable to retrieve source code") # Common torchcam warning
+warnings.filterwarnings("ignore", message="Unable to retrieve source code")
 
 
 # --- Configuration ---
-MODEL_WEIGHTS_PATH = "best_model_finetuned.pth"
+IMAGE_MODEL_WEIGHTS = "best_model_finetuned_image.pth" # Your image model
+VIDEO_MODEL_WEIGHTS = "best_model_finetuned_video.pth" # Your video model
+
 UPLOAD_FOLDER = 'static/uploads'
 RESULTS_FOLDER = 'static/results'
-# Added video extensions
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'mp4', 'avi', 'mov'}
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-FRAMES_PER_SECOND_TO_PROCESS = 1 # Process 1 frame per second
-
-# --- EfficientNet_LSTM Model Definition ---
-class EfficientNet_LSTM(nn.Module):
-    # --- Model class definition remains the same ---
-    def __init__(self, lstm_hidden_size=256, lstm_layers=2, bidirectional=True):
-        super(EfficientNet_LSTM, self).__init__()
-
-        weights = EfficientNet_B0_Weights.DEFAULT
-        self.efficientnet = efficientnet_b0(weights=weights)
-
-        for param in self.efficientnet.parameters():
-            param.requires_grad = False
-
-        num_features = self.efficientnet.classifier[1].in_features
-        self.efficientnet.classifier = nn.Identity()
-
-        self.lstm = nn.LSTM(
-            input_size=num_features,
-            hidden_size=lstm_hidden_size,
-            num_layers=lstm_layers,
-            bidirectional=bidirectional,
-            batch_first=True
-        )
-
-        lstm_output_size = lstm_hidden_size * 2 if bidirectional else lstm_hidden_size
-        self.classifier = nn.Sequential(
-            nn.Linear(lstm_output_size, 128),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(128, 1)
-        )
-
-    def forward(self, x):
-        batch_size, seq_len, c, h, w = x.shape
-        x = x.view(batch_size * seq_len, c, h, w)
-        features = self.efficientnet(x)
-        features = features.view(batch_size, seq_len, -1)
-        lstm_out, _ = self.lstm(features)
-        lstm_out = lstm_out[:, -1, :]
-        output = self.classifier(lstm_out)
-        return output
+FRAMES_PER_SECOND_TO_PROCESS = 1 
 
 # --- Global Variables ---
 app = Flask(__name__)
-model = None
+image_model = None
+video_model = None
 
-# --- Image Transforms (MATCHING TRAINING - ONLY ToTensor) ---
+# --- Transforms ---
 image_transforms = transforms.Compose([
+    transforms.Resize((224, 224), antialias=True), 
     transforms.ToTensor(),
-    # transforms.Resize((224, 224), antialias=True), # Commented out as per training
-    # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), # Commented out as per training
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
-# --- Video Transforms (MATCHING TRAINING - ONLY ToTensor) ---
 video_frame_transforms = transforms.Compose([
-    transforms.ToTensor(), # Converts numpy HWC [0,255] to torch CHW [0.0, 1.0]
-    # transforms.Resize((224, 224), antialias=True), # Commented out as per training
-    # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), # Commented out as per training
+    transforms.Resize((224, 224), antialias=True),
+    transforms.ToTensor(), 
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
 
@@ -107,36 +66,66 @@ def allowed_file(filename):
 def is_video_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'mp4', 'avi', 'mov'}
 
-def load_model(weights_path):
-    # --- load_model function remains the same ---
-    global model
-    if not os.path.exists(weights_path):
-        raise FileNotFoundError(f"Model weights not found at {weights_path}.")
-    print(f"Loading model from {weights_path} onto {DEVICE}...")
-    model = EfficientNet_LSTM().to(DEVICE)
-    model.load_state_dict(torch.load(weights_path, map_location=DEVICE))
-    model.eval()
-    print("Model loaded successfully.")
+def load_models():
+    global image_model, video_model
+    
+    # Load Image Model
+    try:
+        if not os.path.exists(IMAGE_MODEL_WEIGHTS):
+            raise FileNotFoundError(f"Image model weights not found at {IMAGE_MODEL_WEIGHTS}.")
+        print(f"Loading IMAGE model from {IMAGE_MODEL_WEIGHTS} onto {DEVICE}...")
+        image_model = EfficientNet_LSTM().to(DEVICE) # Use the LSTM class
+        image_model.load_state_dict(torch.load(IMAGE_MODEL_WEIGHTS, map_location=DEVICE))
+        image_model.eval()
+        print("Image model loaded successfully.")
+    except Exception as e:
+        print(f"FATAL ERROR loading IMAGE model: {e}")
+        image_model = None # Set to None if loading fails
 
+    # Load Video Model
+    try:
+        if not os.path.exists(VIDEO_MODEL_WEIGHTS):
+            raise FileNotFoundError(f"Video model weights not found at {VIDEO_MODEL_WEIGHTS}.")
+        print(f"Loading VIDEO model from {VIDEO_MODEL_WEIGHTS} onto {DEVICE}...")
+        video_model = EfficientNet_LSTM().to(DEVICE) # Use the LSTM class
+        video_model.load_state_dict(torch.load(VIDEO_MODEL_WEIGHTS, map_location=DEVICE))
+        video_model.eval()
+        print("Video model loaded successfully.")
+    except Exception as e:
+        print(f"FATAL ERROR loading VIDEO model: {e}")
+        video_model = None # Set to None if loading fails
+
+# --- 5D TENSOR FIX 1 ---
 def generate_heatmap(input_pil_image, input_tensor_for_model, prob):
-    # --- generate_heatmap function remains the same ---
-    target_layer_name = 'efficientnet.features.8'
+    """
+    input_tensor_for_model is the 4D tensor (1, C, H, W)
+    """
+    if image_model is None:
+        print("Heatmap generation failed: Image model not loaded.")
+        return None, None
+        
+    target_layer_name = 'efficientnet.features.8' 
+    
     heatmap_filename = f"heatmap_{uuid.uuid4()}.png"
     heatmap_save_path = os.path.join(RESULTS_FOLDER, heatmap_filename)
     heatmap_url = f"/results/{heatmap_filename}"
 
-    model.eval()
-    input_tensor_grad = input_tensor_for_model.clone().detach().requires_grad_(True).to(DEVICE)
+    image_model.eval()
+    # --- FIX: Convert 4D tensor (1,C,H,W) to 5D (1,1,C,H,W) for LSTM model ---
+    input_tensor_grad = input_tensor_for_model.unsqueeze(1).clone().detach().requires_grad_(True).to(DEVICE)
 
     try:
-        with GradCAM(model, target_layer=target_layer_name) as cam_extractor:
-            scores = model(input_tensor_grad)
+        with GradCAM(image_model, target_layer=target_layer_name) as cam_extractor:
+            # Pass the 5D tensor to the model
+            scores = image_model(input_tensor_grad)
+            # Cams will be (1, 1, H, W), squeeze to (H, W)
             cams = cam_extractor(class_idx=0, scores=scores)
 
             if not cams or len(cams) == 0:
                 print("Grad-CAM returned no output.")
                 return None, None
 
+            # Squeeze batch and sequence dimensions
             heatmap_tensor = cams[0].squeeze(0).cpu()
 
             if not isinstance(heatmap_tensor, torch.Tensor) or heatmap_tensor.nelement() == 0:
@@ -152,28 +141,13 @@ def generate_heatmap(input_pil_image, input_tensor_for_model, prob):
             print(f"Heatmap saved to {heatmap_save_path}")
             return heatmap_save_path, heatmap_url
 
-    except ValueError as e:
-        print(f"Error initializing/using Grad-CAM: {e}")
-        return None, None
     except Exception as e:
         print(f"An unexpected error occurred during Grad-CAM: {e}")
         import traceback
         traceback.print_exc()
         return None, None
 
-# --- UPDATED generate_pdf_report Function ---
 def generate_pdf_report(original_file_path, report_filename, decision, **kwargs):
-    """
-    Generates a PDF report for either image or video analysis.
-
-    Args:
-        original_file_path (str): Path to the uploaded original file (image or temp video).
-        report_filename (str): Desired filename for the PDF report.
-        decision (str): The final prediction ('REAL' or 'FAKE').
-        **kwargs: Additional arguments depending on file type.
-            For images: heatmap_image_path (str), probability (float)
-            For videos: frames_processed (int), fake_frames (int), fake_percentage (float), confidence (float)
-    """
     report_save_path = os.path.join(RESULTS_FOLDER, report_filename)
     report_url = f"/results/{report_filename}"
 
@@ -193,7 +167,7 @@ def generate_pdf_report(original_file_path, report_filename, decision, **kwargs)
     story.append(p)
     story.append(Spacer(1, 0.1*inch))
 
-    original_filename = os.path.basename(original_file_path) # Use the base name
+    original_filename = os.path.basename(original_file_path)
     p = Paragraph(f"Analyzed File: {original_filename}", styles['Italic'])
     p.alignment = TA_CENTER
     story.append(p)
@@ -210,7 +184,6 @@ def generate_pdf_report(original_file_path, report_filename, decision, **kwargs)
 
     story.append(Paragraph(f"Prediction: <font color='{decision_style.textColor}'>{decision}</font>", styles['Normal']))
 
-    # --- Add details based on file type ---
     if 'probability' in kwargs: # Image
         probability = kwargs['probability']
         story.append(Paragraph(f"Confidence (Fake): {probability*100:.2f}%", styles['Normal']))
@@ -224,18 +197,15 @@ def generate_pdf_report(original_file_path, report_filename, decision, **kwargs)
         story.append(Paragraph("Video Details:", styles['h3']))
         story.append(Paragraph(f"Frames Analyzed: {frames_processed}", styles['Normal']))
         story.append(Paragraph(f"Frames Classified as FAKE: {fake_frames} ({fake_percentage:.1f}%)", styles['Normal']))
-    # --- End details ---
 
     story.append(Spacer(1, 0.3*inch))
 
-    # --- Add Visual Evidence only for Images ---
     if 'heatmap_image_path' in kwargs:
         heatmap_image_path = kwargs['heatmap_image_path']
         story.append(Paragraph("Visual Evidence:", styles['h2']))
         story.append(Spacer(1, 0.1*inch))
 
         try:
-            # Use original_file_path directly as it was saved for images
             img_orig = ReportLabImage(original_file_path)
             img_orig.drawHeight = 2.5*inch * img_orig.drawHeight / img_orig.drawWidth
             img_orig.drawWidth = 2.5*inch
@@ -258,7 +228,6 @@ def generate_pdf_report(original_file_path, report_filename, decision, **kwargs)
                 story.append(Paragraph("<i>Error loading heatmap image.</i>", styles['Italic']))
         else:
             story.append(Paragraph("<i>Heatmap could not be generated or found.</i>", styles['Italic']))
-    # --- End Visual Evidence ---
 
     try:
         doc.build(story)
@@ -272,30 +241,27 @@ def generate_pdf_report(original_file_path, report_filename, decision, **kwargs)
 # --- Flask Routes ---
 @app.route('/', methods=['GET'])
 def index():
-    # --- UPDATED HTML with SCROLL FIX ---
+    # --- HTML (with scrolling fix) ---
     html_content = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Deepfake Detector</title>
+    <title>Deepfake Detector AI</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        /* --- SCROLLING FIX: Removed height: 100%, align-items; Added min-height, padding-top/bottom --- */
-        html { } /* Removed height: 100% */
+        html { } 
         body {
             font-family: 'Inter', sans-serif;
             display: flex;
-            /* align-items: center; <-- Removed */
             justify-content: center;
             background-color: #e2e8f0;
-            padding: 1.5rem; /* Original padding */
-            padding-top: 2rem; /* Added top padding */
-            padding-bottom: 2rem; /* Added bottom padding */
+            padding: 1.5rem;
+            padding-top: 2rem; 
+            padding-bottom: 2rem; 
             box-sizing: border-box;
-            min-height: 100vh; /* Ensure body takes at least full viewport height */
-            /* Removed height: 100%; */
+            min-height: 100vh;
         }
         .file-input-wrapper { position: relative; display: inline-block; overflow: hidden; cursor: pointer; }
         .file-input-button { position: absolute; top: 0; left: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; z-index: 10; }
@@ -357,7 +323,6 @@ def index():
         <div id="resultsContainer" class="hidden bg-slate-50 p-6 rounded-lg border border-slate-200 shadow-inner">
             <h2 class="text-xl font-semibold text-gray-800 mb-6 text-center">Analysis Results</h2>
             
-            <!-- Image Specific Layout -->
             <div id="imageResultLayout" class="grid grid-cols-1 md:grid-cols-2 gap-6 items-center">
                  <div class="text-center md:text-left space-y-2">
                      <div>
@@ -376,7 +341,6 @@ def index():
                  </div>
             </div>
             
-            <!-- Video Specific Layout (Added Confidence) -->
             <div id="videoResultLayout" class="hidden text-center space-y-3">
                  <div>
                      <p class="text-sm text-gray-500 font-medium uppercase tracking-wider">Overall Prediction:</p>
@@ -384,7 +348,7 @@ def index():
                  </div>
                  <div>
                      <p class="text-sm text-gray-500 font-medium uppercase tracking-wider mt-3">Overall Confidence:</p>
-                     <p id="videoConfidenceText" class="text-xl font-semibold text-gray-900"></p> <!-- NEW -->
+                     <p id="videoConfidenceText" class="text-xl font-semibold text-gray-900"></p>
                  </div>
                  <div>
                      <p class="text-sm text-gray-500 font-medium uppercase tracking-wider mt-3">Details:</p>
@@ -392,7 +356,6 @@ def index():
                  </div>
             </div>
             
-            <!-- Report Button Container (Used by both) -->
             <div id="reportButtonContainer" class="text-center mt-6">
                 <a href="#" id="reportLink" class="report-button hidden" download>Download PDF Report</a>
             </div>
@@ -400,8 +363,8 @@ def index():
         <div id="messageBox" class="hidden mt-6 p-4 rounded-lg text-base text-center font-medium shadow-md"></div>
     </div>
     
-    <!-- UPDATED JavaScript -->
     <script>
+        // --- JavaScript (already updated and correct) ---
         const uploadForm = document.getElementById('uploadForm');
         const fileUpload = document.getElementById('fileUpload');
         const previewContainer = document.getElementById('previewContainer');
@@ -418,7 +381,7 @@ def index():
         const heatmapImage = document.getElementById('heatmapImage');
         const videoResultLayout = document.getElementById('videoResultLayout');
         const videoPredictionText = document.getElementById('videoPredictionText');
-        const videoConfidenceText = document.getElementById('videoConfidenceText'); // NEW
+        const videoConfidenceText = document.getElementById('videoConfidenceText');
         const videoDetailsText = document.getElementById('videoDetailsText');
         const fileError = document.getElementById('fileError');
         const fileNameDisplay = document.getElementById('fileNameDisplay');
@@ -484,7 +447,7 @@ def index():
             detectButton.disabled = true;
             const formData = new FormData();
             formData.append('file', currentFile);
-            formData.append('filename', currentFile.name); // Send original filename
+            formData.append('filename', currentFile.name); 
             try {
                 const response = await fetch('/predict', { method: 'POST', body: formData });
                 const data = await response.json();
@@ -501,20 +464,18 @@ def index():
 
         function displayResults(data) {
             resultsContainer.classList.remove('hidden');
-            reportButtonContainer.classList.remove('hidden'); // Show container for both
+            reportButtonContainer.classList.remove('hidden'); 
 
             if (data.is_video) {
                 imageResultLayout.classList.add('hidden');
                 videoResultLayout.classList.remove('hidden');
 
                 videoPredictionText.textContent = data.decision;
-                // --- NEW: Display Video Confidence ---
                 videoConfidenceText.textContent = `${data.confidence.toFixed(2)}%`;
-                // ---
                 videoDetailsText.textContent = `Analyzed ${data.frames_processed} frames. Found ${data.fake_frames} fake frames (${data.fake_percentage.toFixed(1)}%).`;
 
                 videoPredictionText.classList.remove('result-fake', 'result-real');
-                videoConfidenceText.classList.remove('text-red-700', 'text-green-700'); // Basic color for confidence
+                videoConfidenceText.classList.remove('text-red-700', 'text-green-700');
                 if (data.decision === 'FAKE') {
                     videoPredictionText.classList.add('result-fake');
                     videoConfidenceText.classList.add('text-red-700');
@@ -523,14 +484,12 @@ def index():
                     videoConfidenceText.classList.add('text-green-700');
                 }
 
-                // --- NEW: Show report link for video ---
                  if (data.report_url) {
                     reportLink.href = data.report_url;
                     reportLink.classList.remove('hidden');
                 } else {
                     reportLink.classList.add('hidden');
                 }
-                // ---
 
             } else { // Image
                 videoResultLayout.classList.add('hidden');
@@ -582,52 +541,55 @@ def index():
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    # --- UPDATED Prediction logic ---
-    if model is None: return jsonify({"error": "Model not loaded"}), 500
+    # --- CHANGE: Use the correct model based on file type ---
     if 'file' not in request.files: return jsonify({"error": "No file part"}), 400
     file = request.files['file']
-    original_filename = request.form.get('filename', file.filename) # Get original filename
+    original_filename = request.form.get('filename', file.filename) 
 
     if file.filename == '': return jsonify({"error": "No selected file"}), 400
     if not file or not allowed_file(file.filename):
         return jsonify({"error": "Invalid file type."}), 400
 
     is_video = is_video_file(file.filename)
-    # Use unique filenames to avoid conflicts, use original filename for report
     unique_id = uuid.uuid4()
     base_filename = f"{os.path.splitext(original_filename)[0]}_{unique_id}"
-    upload_save_path = None # Define variable for cleanup
-    video_save_path = None # Define variable for cleanup
+    upload_save_path = None 
+    video_save_path = None 
 
     try:
         if not is_video:
-            # --- Image processing ---
+            # --- IMAGE PREDICTION ---
+            if image_model is None:
+                return jsonify({"error": "Image model is not loaded or failed to load."}), 500
+            
             img_bytes = file.read()
             img_pil = Image.open(io.BytesIO(img_bytes)).convert('RGB')
 
             upload_filename = f"upload_{base_filename}{os.path.splitext(original_filename)[1]}"
             upload_save_path = os.path.join(UPLOAD_FOLDER, upload_filename)
             os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-            # Save the uploaded file for the report
             with open(upload_save_path, "wb") as f_up: f_up.write(img_bytes)
 
+            # --- CHANGE: Use image_transforms and image_model ---
             input_tensor = image_transforms(img_pil)
-            input_tensor_model = input_tensor.unsqueeze(0).unsqueeze(0).to(DEVICE)
+            # --- 5D TENSOR FIX 2 ---
+            # Add batch and sequence dims: (C, H, W) -> (1, 1, C, H, W)
+            input_tensor_model = input_tensor.unsqueeze(0).unsqueeze(0).to(DEVICE) 
 
             with torch.no_grad():
-                outputs = model(input_tensor_model)
+                outputs = image_model(input_tensor_model) # Pass 5D tensor
                 prob_tensor = torch.sigmoid(outputs).squeeze()
                 prob = prob_tensor.item()
 
             decision = "FAKE" if prob > 0.5 else "REAL"
-            heatmap_abs_path, heatmap_rel_url = generate_heatmap(img_pil, input_tensor_model, prob)
+            # --- CHANGE: Pass the 4D tensor to heatmap (1, C, H, W) ---
+            heatmap_abs_path, heatmap_rel_url = generate_heatmap(img_pil, input_tensor.unsqueeze(0), prob)
 
             report_filename = f"report_{base_filename}.pdf"
             report_url = generate_pdf_report(
-                original_file_path=upload_save_path, # Pass the saved image path
+                original_file_path=upload_save_path, 
                 report_filename=report_filename,
                 decision=decision,
-                # Image specific kwargs
                 heatmap_image_path=heatmap_abs_path,
                 probability=prob
             )
@@ -641,9 +603,11 @@ def predict():
             })
 
         else:
-            # --- Video processing ---
+            # --- VIDEO PREDICTION ---
+            if video_model is None:
+                return jsonify({"error": "Video model is not loaded or failed to load."}), 500
+
             temp_dir = tempfile.gettempdir()
-            # Use a unique temp filename, but keep original for report title
             video_temp_filename = f"video_{unique_id}{os.path.splitext(original_filename)[1]}"
             video_save_path = os.path.join(temp_dir, video_temp_filename)
             file.save(video_save_path)
@@ -655,7 +619,7 @@ def predict():
             fps = cap.get(cv2.CAP_PROP_FPS)
             frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             frame_interval = int(fps / FRAMES_PER_SECOND_TO_PROCESS) if fps > 0 and FRAMES_PER_SECOND_TO_PROCESS > 0 else 1
-            if frame_interval <= 0: frame_interval = 1 # Ensure interval is at least 1
+            if frame_interval <= 0: frame_interval = 1 
 
             print(f"Video Info: FPS={fps:.2f}, Frames={frame_count}, Sampling Interval={frame_interval}")
 
@@ -669,14 +633,15 @@ def predict():
 
                 if current_frame_idx % frame_interval == 0:
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    # --- IMPORTANT: Convert numpy array to PIL Image before transform ---
                     frame_pil = Image.fromarray(frame_rgb)
-                    input_tensor = video_frame_transforms(frame_pil) # Use video transforms
-                    # --- END CHANGE ---
+                    # --- CHANGE: Use video_frame_transforms ---
+                    input_tensor = video_frame_transforms(frame_pil) 
+                    # --- CHANGE: Use video_model and correct tensor shape (1, 1, C, H, W) ---
+                    # The video model expects a "sequence" of 1 frame
                     input_tensor_model = input_tensor.unsqueeze(0).unsqueeze(0).to(DEVICE)
 
                     with torch.no_grad():
-                        outputs = model(input_tensor_model)
+                        outputs = video_model(input_tensor_model)
                         prob_tensor = torch.sigmoid(outputs).squeeze()
                         prob = prob_tensor.item()
                         frame_predictions.append(prob)
@@ -691,28 +656,22 @@ def predict():
 
             fake_frames = sum(1 for p in frame_predictions if p > 0.5)
             fake_percentage = (fake_frames / frames_processed) * 100 if frames_processed > 0 else 0
-            overall_decision = "FAKE" if fake_percentage >= 50 else "REAL" # Changed to >= 50
+            overall_decision = "FAKE" if fake_percentage >= 50 else "REAL" 
 
-            # --- NEW: Calculate overall confidence ---
-            # If FAKE, confidence is % fake frames. If REAL, confidence is % real frames.
             overall_confidence = fake_percentage if overall_decision == "FAKE" else (100.0 - fake_percentage)
-            # ---
 
             print(f"Video Analysis: Processed={frames_processed}, Fake={fake_frames} ({fake_percentage:.1f}%), Decision={overall_decision}, Confidence={overall_confidence:.2f}%")
 
-            # --- NEW: Generate PDF Report for Video ---
             report_filename = f"report_{base_filename}.pdf"
             report_url = generate_pdf_report(
-                original_file_path=original_filename, # Pass original filename for title
+                original_file_path=original_filename, 
                 report_filename=report_filename,
                 decision=overall_decision,
-                # Video specific kwargs
                 frames_processed=frames_processed,
                 fake_frames=fake_frames,
                 fake_percentage=fake_percentage,
                 confidence=overall_confidence
             )
-            # ---
 
             return jsonify({
                 "is_video": True,
@@ -720,9 +679,9 @@ def predict():
                 "frames_processed": frames_processed,
                 "fake_frames": fake_frames,
                 "fake_percentage": fake_percentage,
-                "confidence": overall_confidence, # NEW: Return confidence
-                "heatmap_url": "N/A", # No heatmap for video
-                "report_url": report_url if report_url else None # NEW: Return report URL
+                "confidence": overall_confidence,
+                "heatmap_url": "N/A", 
+                "report_url": report_url if report_url else None
             })
 
     except Exception as e:
@@ -731,7 +690,6 @@ def predict():
         traceback.print_exc()
         return jsonify({"error": "Failed to process file."}), 500
     finally:
-        # Cleanup temp files
         if upload_save_path and os.path.exists(upload_save_path):
              try: os.remove(upload_save_path)
              except Exception as e_clean: print(f"Error cleaning up image {upload_save_path}: {e_clean}")
@@ -740,15 +698,11 @@ def predict():
              except Exception as e_clean: print(f"Error cleaning up video {video_save_path}: {e_clean}")
 
 
-# Route to serve generated results (heatmaps and reports)
 @app.route('/results/<filename>')
 def serve_result_file(filename):
-    # --- This route remains the same ---
-    # Basic security check
     if '..' in filename or filename.startswith('/'):
         return "Invalid filename", 400
     safe_path = os.path.abspath(os.path.join(RESULTS_FOLDER, filename))
-    # Double-check it's still within the intended directory
     if not safe_path.startswith(os.path.abspath(RESULTS_FOLDER)):
          return "File access denied", 403
     if not os.path.exists(safe_path) or not filename.lower().endswith(('.png', '.pdf')):
@@ -758,15 +712,22 @@ def serve_result_file(filename):
 
 # --- Main Execution ---
 if __name__ == '__main__':
-    # --- Main execution remains the same ---
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
     os.makedirs(RESULTS_FOLDER, exist_ok=True)
     try:
-        load_model(MODEL_WEIGHTS_PATH)
-    except FileNotFoundError as e:
-        print(f"FATAL ERROR: {e}")
-        exit(1)
+        # --- CHANGE: Call the new function to load BOTH models ---
+        load_models()
     except Exception as e:
-        print(f"FATAL ERROR loading model: {e}")
+        print(f"FATAL ERROR during model loading: {e}")
         exit(1)
+        
+    if image_model is None and video_model is None:
+        print("FATAL ERROR: No models could be loaded. Exiting.")
+        exit(1)
+    elif image_model is None:
+        print("Warning: Image model failed to load. Only video processing will be available.")
+    elif video_model is None:
+        print("Warning: Video model failed to load. Only image processing will be available.")
+        
     app.run(debug=True, host='0.0.0.0', port=5000)
+
